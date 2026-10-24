@@ -1,0 +1,15 @@
+{
+  "identifier": "com.plus381.tools",
+  "name": "Plus381 Tools",
+  "description": "Plus381 Robotics team parts library: import, publish and auto-sync.",
+  "description_full": "Connects KiCad to the Plus381 Robotics shared parts library (github.com/plus381-robotics/kicad-parts).\n\n- Setup: downloads the library, registers all Plus381_* libraries and the PLUS381_PARTS path variable.\n- Import part: turns a SnapEDA / Mouser / UltraLibrarian / DigiKey zip into a library part (symbol, footprint, 3D model).\n- Publish: shares new and edited parts with the team.\n- Background sync keeps the library up to date every minute, even when KiCad is closed.\n\nRequires Git (with Git LFS) and access to the plus381-robotics GitHub organisation. Enable Preferences > Plugins > Enable KiCad API.",
+  "type": "plugin",
+  "category": "productivity",
+  "author": {"name": "Plus381 Robotics", "contact": {"web": "https://github.com/plus381-robotics/kicad-plugins"}},
+  "license": "MIT",
+  "resources": {"Homepage": "https://github.com/plus381-robotics/kicad-plugins", "Parts library": "https://github.com/plus381-robotics/kicad-parts"},
+  "tags": ["library", "parts", "team", "git"],
+  "status": "stable",
+  "kicad_version": "10.0",
+  "icon": "icons/plugin-64.png"
+}

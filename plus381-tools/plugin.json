@@ -1,0 +1,42 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.plus381.tools",
+  "name": "Plus381 Tools",
+  "description": "Plus381 Robotics team parts library: import vendor parts, publish them and keep everyone's library up to date.",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.9"
+  },
+  "actions": [
+    {
+      "identifier": "import-part",
+      "name": "Plus381: Import part",
+      "description": "Import a part from a vendor zip (SnapEDA, Mouser, UltraLibrarian, ...) into the team library",
+      "show-button": true,
+      "scopes": ["pcb", "schematic", "footprint", "symbol", "project_manager"],
+      "entrypoint": "import_part.py",
+      "icons-light": ["icons/import-light-24.png", "icons/import-light-48.png"],
+      "icons-dark": ["icons/import-dark-24.png", "icons/import-dark-48.png"]
+    },
+    {
+      "identifier": "publish",
+      "name": "Plus381: Publish changes",
+      "description": "Share your new or edited parts with the team",
+      "show-button": true,
+      "scopes": ["pcb", "schematic", "footprint", "symbol", "project_manager"],
+      "entrypoint": "publish.py",
+      "icons-light": ["icons/publish-light-24.png", "icons/publish-light-48.png"],
+      "icons-dark": ["icons/publish-dark-24.png", "icons/publish-dark-48.png"]
+    },
+    {
+      "identifier": "library-status",
+      "name": "Plus381: Library status",
+      "description": "Sync status, setup, background sync and library check",
+      "show-button": true,
+      "scopes": ["pcb", "schematic", "footprint", "symbol", "project_manager"],
+      "entrypoint": "library_status.py",
+      "icons-light": ["icons/status-light-24.png", "icons/status-light-48.png"],
+      "icons-dark": ["icons/status-dark-24.png", "icons/status-dark-48.png"]
+    }
+  ]
+}
