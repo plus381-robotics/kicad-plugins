@@ -37,13 +37,15 @@ def pending_changes(cfg):
     except GitError:
         ahead = 0
     if ahead:
+        in_review = partsync.load_config().get("publish_mode") == "pr"
+        note = ", waiting for review (pull request)" if in_review else ", not uploaded yet"
         out = git(cfg, "diff", "--name-status", f"origin/{BRANCH}", "HEAD").stdout
         for line in out.splitlines():
             st, _, path = line.partition("\t")
             path = path.split("\t")[-1]
             if not any(i[3] == path for i in items):
                 name, kind = describe(path)
-                items.append((name, kind, STATUS_WORDS.get(st[:1], "changed") + ", not uploaded yet", path))
+                items.append((name, kind, STATUS_WORDS.get(st[:1], "changed") + note, path))
     return items
 
 
@@ -79,18 +81,38 @@ def run_check(cfg):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
-def publish(cfg, message):
-    """Commit everything, put it on top of the newest team version and push.
-    Raises Conflict when someone else changed the same file meanwhile."""
+def publish(cfg, message, token=None, mode="direct"):
+    """Commit everything and put it on top of the newest team version, then
+    push it (members) or send it as a pull request (everyone else).
+    Raises Conflict when someone else changed the same file meanwhile.
+    Returns the pull request URL in "pr" mode, else None."""
+    from . import github
+    url = None
     with Lock():
         if partsync.changed_files(cfg):
             git(cfg, "add", "-A")
             git(cfg, "commit", "--quiet", "-m", message)
-        _rebase_and_push(cfg)
-    return partsync.run_sync(cfg, quiet=True)
+        if mode == "pr":
+            _rebase_and_push(cfg, push=False)
+            url, _ = github.open_pull_request(cfg, token, message, _pr_body(cfg))
+        else:
+            _rebase_and_push(cfg)
+    partsync.run_sync(cfg, quiet=True)
+    return url
 
 
-def _rebase_and_push(cfg, strategy=None):
+def _pr_body(cfg):
+    lines = ["Parts published from KiCad with Plus381 Tools.", ""]
+    out = git(cfg, "diff", "--name-status", f"origin/{BRANCH}", "HEAD").stdout
+    for line in out.splitlines():
+        st, _, path = line.partition("\t")
+        name, kind = describe(path.split("\t")[-1])
+        lines.append(f"- {STATUS_WORDS.get(st[:1], 'changed')} {kind}: `{name}`")
+    lines += ["", "Check the 3D model and pins, then merge. Everyone gets the part within a minute."]
+    return "\n".join(lines)
+
+
+def _rebase_and_push(cfg, strategy=None, push=True):
     git(cfg, "fetch", "--quiet", "origin", BRANCH)
     ahead, behind = partsync.ahead_behind(cfg)
     if behind:
@@ -101,17 +123,17 @@ def _rebase_and_push(cfg, strategy=None):
                      if l[:2] in ("UU", "AA", "DU", "UD")]
             git(cfg, "rebase", "--abort", check=False)
             raise Conflict(files or ["(unknown)"])
-    if partsync.ahead_behind(cfg)[0]:
+    if push and partsync.ahead_behind(cfg)[0]:
         git(cfg, "push", "--quiet", "origin", f"HEAD:{BRANCH}")
 
 
-def resolve(cfg, keep):
+def resolve(cfg, keep, push=True):
     """After a Conflict: keep='mine' overwrites the other version with yours,
     keep='theirs' takes the team version and saves yours in a backup folder."""
     with Lock():
         if keep == "mine":
             # During a rebase, "theirs" means the commits being replayed: yours.
-            _rebase_and_push(cfg, strategy="theirs")
+            _rebase_and_push(cfg, strategy="theirs", push=push)
             return None
         backup = app_dir() / "backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
         out = git(cfg, "diff", "--name-only", f"origin/{BRANCH}", "HEAD").stdout.split()

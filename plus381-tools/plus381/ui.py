@@ -6,11 +6,12 @@ import shutil
 import subprocess
 import threading
 import traceback
+import webbrowser
 from pathlib import Path
 
 import wx
 
-from . import autosync, importer, partsync, publish
+from . import autosync, github, importer, partsync, publish
 from .partsync import Conflict, GitError
 
 TITLE = "Plus381 Tools"
@@ -183,6 +184,8 @@ class SetupDialog(wx.Dialog):
         self.email = wx.TextCtrl(p, value=email)
         g.Add(self.email, 1, wx.EXPAND)
         s.Add(g, 0, wx.EXPAND | wx.ALL, PAD)
+        s.Add(label(p, "Name and e-mail are optional: they are filled in from your GitHub account when you "
+                       "first publish.", wrap=520), 0, wx.LEFT | wx.RIGHT, PAD)
 
         self.auto = wx.CheckBox(p, label="Keep the library up to date automatically while KiCad is open "
                                          "(checks every minute)")
@@ -213,10 +216,6 @@ class SetupDialog(wx.Dialog):
         wx.CallAfter(self.log.AppendText, text + "\n")
 
     def on_go(self, _):
-        if not self.email.GetValue().strip() or not self.name.GetValue().strip():
-            error(self, "Fill in your name and the e-mail of your GitHub account. "
-                        "They are shown next to the parts you publish.", "Missing details")
-            return
         self.go.Disable()
         try:
             _, problems = run_busy(self, "Setting up (the first download can take a few minutes)...", do_setup,
@@ -550,27 +549,66 @@ class PublishDialog(wx.Dialog):
             if wx.MessageBox("Your changes have problems (see the list). Teammates may get broken parts.\n\n"
                              "Publish anyway?", TITLE, wx.YES_NO | wx.ICON_WARNING, self) != wx.YES:
                 return
+        login = self.ensure_login()
+        if login is False:
+            return
+        self.token, self.mode = login or (None, "direct")
         if publish.identity_missing(self.cfg):
             name = wx.GetTextFromUser("Your name (shown next to your changes):", TITLE, parent=self)
             email = wx.GetTextFromUser("The e-mail of your GitHub account:", TITLE, parent=self)
             if not (name and email):
                 return
             publish.set_identity(self.cfg, name, email)
+        message = self.msg.GetValue().strip() or "Update parts"
         try:
-            run_busy(self, "Publishing...", publish.publish, self.cfg, self.msg.GetValue().strip() or "Update parts")
+            url = run_busy(self, "Publishing...", publish.publish, self.cfg, message, self.token, self.mode)
         except Conflict as c:
             self.conflict(c)
         except Exception as e:  # noqa: BLE001
             hint = ""
             if re.search(r"auth|credential|permission|403|could not read username", str(e), re.I):
-                hint = ("\n\nGit is not logged in to GitHub, or your account can't write to "
-                        "plus381-robotics/kicad-parts. Log in once (GitHub Desktop, or run 'git push' in the "
-                        f"library folder {self.cfg['parts_dir']} in a terminal) and ask an admin to add you "
-                        "to the organisation if needed.")
+                hint = ("\n\nGitHub refused the upload. Open Library status > Log in to GitHub and try again.")
             error(self, f"Publishing failed:\n{e}{hint}\n\nYour changes are saved locally; try again later.")
         else:
-            info(self, "Published. Everyone gets your changes within a minute.", "Published")
+            self.done(url)
         self.refresh()
+
+    def ensure_login(self):
+        """(token, mode) when logged in, None when in-plugin login isn't
+        configured (fall back to whatever login Git has), False if cancelled."""
+        if not github.client_id():
+            return None
+        try:
+            token = run_busy(self, "Checking your GitHub login...", github.get_token, self.cfg)
+            if token:
+                mode = run_busy(self, "Checking your GitHub login...",
+                                lambda: "direct" if github.can_push(token) else "pr")
+                return token, mode
+        except github.GitHubError as e:
+            if " 401 " not in str(e) + " ":
+                error(self, e, "Can't reach GitHub")
+                return False
+            # 401: the saved login was revoked or expired, so log in again
+        if wx.MessageBox("To publish, log in to GitHub once. It takes a few seconds in your browser "
+                         "and KiCad remembers it.\n\nLog in now?", TITLE, wx.YES_NO | wx.ICON_QUESTION,
+                         self) != wx.YES:
+            return False
+        result = login_dialog(self, self.cfg)
+        if not result:
+            return False
+        me, mode = result
+        token = github.get_token(self.cfg)
+        return token, mode
+
+    def done(self, url):
+        if url:
+            if wx.MessageBox("Your account can't change the team library directly, so your parts were sent as "
+                             "a pull request. A team member checks and merges it, then everyone gets them.\n\n"
+                             f"{url}\n\nOpen it in the browser?", f"{TITLE}: Sent for review",
+                             wx.YES_NO | wx.ICON_INFORMATION, self) == wx.YES:
+                webbrowser.open(url)
+        else:
+            info(self, "Published. Everyone gets your changes within a minute.", "Published")
 
     def conflict(self, c):
         names = "\n".join("- " + publish.describe(f)[0] for f in c.files)
@@ -582,13 +620,106 @@ class PublishDialog(wx.Dialog):
         dlg.Destroy()
         try:
             if ans == wx.ID_YES:
-                run_busy(self, "Publishing your version...", publish.resolve, self.cfg, "mine")
-                info(self, "Published your version.")
+                mode = getattr(self, "mode", "direct")
+                run_busy(self, "Publishing your version...", publish.resolve, self.cfg, "mine", mode != "pr")
+                url = None
+                if mode == "pr":
+                    url, _ = run_busy(self, "Sending for review...", github.open_pull_request, self.cfg,
+                                      self.token, self.msg.GetValue().strip() or "Update parts",
+                                      publish._pr_body(self.cfg))
+                self.done(url)
             elif ans == wx.ID_NO:
                 backup = run_busy(self, "Taking the team's version...", publish.resolve, self.cfg, "theirs")
                 info(self, f"Took the team's version. Your version was saved in:\n{backup}")
         except Exception as e:  # noqa: BLE001
             error(self, e)
+
+
+# --------------------------------------------------------------------------
+# GitHub login
+# --------------------------------------------------------------------------
+
+class LoginDialog(wx.Dialog):
+    """Shows the one-time code for GitHub's device login and waits for the
+    user to approve it in the browser."""
+
+    def __init__(self, parent, start):
+        super().__init__(parent, title=f"{TITLE}: Log in to GitHub")
+        self.start = start
+        self.token = None
+        self.err = None
+        self.cancelled = False
+        p = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(label(p, "1. Click 'Open GitHub' (or go to " + github.device_page(start) + ")\n"
+                       "2. Enter this code and click Continue / Authorize:"), 0, wx.ALL, PAD)
+        code = wx.StaticText(p, label=start["user_code"])
+        f = code.GetFont()
+        f.SetPointSize(f.GetPointSize() * 2)
+        code.SetFont(f.Bold())
+        s.Add(code, 0, wx.ALIGN_CENTER | wx.ALL, PAD * 2)
+        self.status = label(p, "Waiting for you to approve in the browser...")
+        s.Add(self.status, 0, wx.ALL, PAD)
+        b = wx.BoxSizer(wx.HORIZONTAL)
+        copy = wx.Button(p, label="Copy code")
+        open_ = wx.Button(p, label="Open GitHub")
+        cancel = wx.Button(p, wx.ID_CANCEL, label="Cancel")
+        for btn in (copy, open_, cancel):
+            b.Add(btn, 0, wx.LEFT, PAD)
+        s.Add(b, 0, wx.ALIGN_RIGHT | wx.ALL, PAD)
+        p.SetSizer(s)
+        s.Fit(self)
+        copy.Bind(wx.EVT_BUTTON, self.on_copy)
+        open_.Bind(wx.EVT_BUTTON, lambda e: webbrowser.open(github.device_page(start)))
+        self.Bind(wx.EVT_BUTTON, self.on_cancel, id=wx.ID_CANCEL)
+        open_.SetDefault()
+        threading.Thread(target=self.wait, daemon=True).start()
+
+    def on_copy(self, _):
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(self.start["user_code"]))
+            wx.TheClipboard.Close()
+            self.status.SetLabel("Code copied. Paste it on the GitHub page.")
+
+    def on_cancel(self, _):
+        self.cancelled = True
+        self.EndModal(wx.ID_CANCEL)
+
+    def wait(self):
+        try:
+            self.token = github.wait_for_login(self.start, lambda: self.cancelled)
+        except github.GitHubError as e:
+            self.err = e
+        if not self.cancelled:
+            wx.CallAfter(self.EndModal, wx.ID_OK if self.token else wx.ID_ABORT)
+
+
+def login_dialog(parent, cfg):
+    """Run the whole login. Returns (user, mode) or None."""
+    try:
+        start = run_busy(parent, "Contacting GitHub...", github.start_login)
+    except github.GitHubError as e:
+        error(parent, e, "Login not possible")
+        return None
+    webbrowser.open(github.device_page(start))
+    dlg = LoginDialog(parent, start)
+    dlg.ShowModal()
+    token, err = dlg.token, dlg.err
+    dlg.Destroy()
+    if err:
+        error(parent, err, "Login failed")
+    if not token:
+        return None
+    try:
+        me, mode = run_busy(parent, "Finishing login...", github.after_login, cfg, token)
+    except Exception as e:  # noqa: BLE001
+        error(parent, e, "Login failed")
+        return None
+    how = ("You can publish straight to the team library." if mode == "direct" else
+           "Your account isn't a member of plus381-robotics, so your parts will be sent as pull requests "
+           "for the team to review.")
+    info(parent, f"Logged in to GitHub as {me['login']}.\n\n{how}", "Logged in")
+    return me, mode
 
 
 # --------------------------------------------------------------------------
@@ -606,7 +737,8 @@ class StatusDialog(wx.Dialog):
         b = wx.WrapSizer()
         buttons = [("Sync now", self.on_sync), ("Check library", self.on_check),
                    ("Open library folder", lambda e: publish.open_folder(cfg["parts_dir"])),
-                   ("Background sync on/off", self.on_toggle), ("Run setup again", self.on_setup)]
+                   ("Background sync on/off", self.on_toggle), ("Run setup again", self.on_setup),
+                   ("Log in to GitHub", self.on_login), ("Log out", self.on_logout)]
         for text, fn in buttons:
             btn = wx.Button(p, label=text)
             btn.Bind(wx.EVT_BUTTON, fn)
@@ -637,6 +769,7 @@ class StatusDialog(wx.Dialog):
             f"Background sync:  {'on (every minute while KiCad is open)' if auto else 'OFF - library only updates when you use the plugin'}",
             f"Path variable:    {'ok' if partsync.env_var_ok(cfg['parts_dir']) else 'not set yet - close KiCad completely and open it again'}",
             f"Unpublished:      {pending} change(s)",
+            f"GitHub:           {self.github_line()}",
         ]
         if st.get("message"):
             lines += ["", "Message: " + st["message"]]
@@ -647,6 +780,24 @@ class StatusDialog(wx.Dialog):
         if extra:
             lines += ["", extra]
         self.text.SetValue("\n".join(lines))
+
+    def github_line(self):
+        c = partsync.load_config()
+        if not c.get("github_login"):
+            return "not logged in (only needed to publish)"
+        how = "publishes via pull request" if c.get("publish_mode") == "pr" else "publishes directly"
+        return f"{c['github_login']} ({how})"
+
+    def on_login(self, _):
+        login_dialog(self, self.cfg)
+        self.refresh()
+
+    def on_logout(self, _):
+        try:
+            github.logout(self.cfg)
+        except Exception as e:  # noqa: BLE001
+            error(self, e)
+        self.refresh("Logged out of GitHub.")
 
     def on_sync(self, _):
         try:

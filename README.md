@@ -8,29 +8,26 @@ KiCad 10 plugins for the Plus381 Robotics team.
 
 ## Install (once per computer, about 5 minutes)
 
-You need **KiCad 10** and **Git with Git LFS**. To **publish** parts you also
-need a GitHub account in the plus381-robotics organisation. Downloading the
-library needs no account, since `kicad-parts` is public.
+You need **KiCad 10** and **Git with Git LFS**. Using parts needs no account,
+since `kicad-parts` is public. To **publish** you need any GitHub account and
+log in once from inside KiCad (see *Logging in* below).
 
 * **Windows:** [Git for Windows](https://git-scm.com/download/win) (LFS is
   included) or GitHub Desktop.
 * **macOS:** `brew install git git-lfs`
 * **Linux:** install `git` and `git-lfs` from your package manager.
 
-1. **To publish parts, log in to GitHub once.** On Windows, Git opens a
-   browser login on your first Publish. On macOS/Linux, sign in with GitHub
-   Desktop or set up a Git credential helper. Skip this if you only use parts.
-2. KiCad → **Preferences → Preferences → Plugins** → tick **Enable KiCad API**,
+1. KiCad → **Preferences → Preferences → Plugins** → tick **Enable KiCad API**,
    then click OK.
-3. KiCad → **Plugin and Content Manager → Manage** (top right) → **+** and add
+2. KiCad → **Plugin and Content Manager → Manage** (top right) → **+** and add
    `https://plus381-robotics.github.io/kicad-plugins/repository.json`.
    Choose that repository in the drop-down, find **Plus381 Tools**, click
    **Install**, then **Apply Pending Changes**.
-4. Open the PCB Editor. Three new toolbar buttons appear on the right:
+3. Open the PCB Editor. Three new toolbar buttons appear on the right:
    **Import part**, **Library status** and **Publish**. Click any of them:
    the **Setup** window opens. Check the folder, your name and your GitHub
    e-mail, and click **Set up**.
-5. **Close KiCad completely and open it again.** All `Plus381_*` libraries now
+4. **Close KiCad completely and open it again.** All `Plus381_*` libraries now
    appear in the symbol and footprint choosers of every project.
 
 The first click on a button after installing or updating takes a few seconds
@@ -45,9 +42,28 @@ longer while KiCad prepares the plugin.
 | Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
 | See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
 
-Publishing goes straight to the team library. If someone else changed the same
-part at the same time, the plugin asks whose version to keep and backs up
-the other one.
+If someone else changed the same part at the same time, the plugin asks
+whose version to keep and backs up the other one.
+
+## Logging in (only for publishing)
+
+The first time you click **Publish**, the plugin asks you to log in:
+
+1. A window shows a code like `WDJB-MJHT` and your browser opens
+   github.com/login/device.
+2. Enter the code and click **Authorize**. KiCad continues by itself.
+
+The login is kept in your computer's credential storage (Windows Credential
+Manager, macOS Keychain, or a private file in the plugin's settings folder on
+Linux) and reused from then on. **Library status** shows who is logged in and
+has **Log in to GitHub** / **Log out** buttons.
+
+* **Members of plus381-robotics** publish straight into the team library.
+* **Anyone else** (alumni, other teams) can publish too: the plugin creates
+  their own copy (fork) of `kicad-parts` and opens a **pull request**. A member
+  reviews and merges it, then everyone gets the part. Publishing again
+  before it's merged updates the same pull request. The parts stay usable on
+  the author's computer while they wait for review.
 
 ## How it works
 
@@ -96,6 +112,7 @@ plus381-tools/
   plus381/autosync.py    installs the background job per OS
   plus381/importer.py    vendor zip -> library part
   plus381/publish.py     commit / push / conflict handling
+  plus381/github.py      in-plugin GitHub login (device flow), fork + pull request
   plus381/ui.py          wxPython windows
 pcm/build.py             builds the PCM repository into dist/
 ```
@@ -110,3 +127,22 @@ pcm/build.py             builds the PCM repository into dist/
   GitHub Pages site, and KiCad offers the update in the Plugin and Content
   Manager.
 * One-time repo setting: **Settings → Pages → Source: GitHub Actions**.
+
+### GitHub login (OAuth App), one-time setup by an org owner
+
+1. github.com/organizations/plus381-robotics → **Settings → Developer settings
+   → OAuth Apps → New OAuth App**.
+   * Application name: `Plus381 Tools`
+   * Homepage URL: `https://github.com/plus381-robotics/kicad-plugins`
+   * Authorization callback URL: `https://github.com/plus381-robotics/kicad-plugins`
+     (not used by device login, but required by the form)
+2. Create it, then tick **Enable Device Flow** and save.
+3. Copy the **Client ID** into `CLIENT_ID` in `plus381-tools/plus381/github.py`,
+   bump `__version__`, and push. The Client ID is public by design, and no
+   client secret is used or needed.
+
+The plugin asks for the `public_repo` scope: enough to push to `kicad-parts`,
+fork it and open pull requests. Until `CLIENT_ID` is set, Publish falls back to
+whatever login Git already has (e.g. Git Credential Manager on Windows).
+For tests, `PLUS381_GITHUB_CLIENT_ID`, `PLUS381_GITHUB_WEB` and
+`PLUS381_GITHUB_API` override the client ID and GitHub addresses.

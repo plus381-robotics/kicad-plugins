@@ -410,7 +410,10 @@ def sync(cfg, push=True):
                     git(cfg, "rebase", "--abort", check=False)
                     raise Conflict(files)
         ahead, behind = ahead_behind(cfg)
-        if push and ahead and not behind:
+        # People without write access publish through pull requests: their
+        # commits wait locally until the pull request is merged.
+        direct = load_config().get("publish_mode") != "pr"
+        if push and direct and ahead and not behind:
             git(cfg, "push", "--quiet", "origin", f"HEAD:{BRANCH}")
         after = git(cfg, "rev-parse", "HEAD").stdout.strip()
         if after != before:
@@ -442,8 +445,23 @@ def run_sync(cfg, quiet=False):
     return st
 
 
+def update_self(cfg, argv):
+    """The scheduler runs a copy of this file. When the plugin was updated,
+    take the plugin's newer version and restart with it."""
+    src = cfg.get("plugin_partsync")
+    me = os.path.abspath(__file__)
+    try:
+        if src and os.path.isfile(src) and os.path.abspath(src) != me and \
+                Path(src).read_bytes() != Path(me).read_bytes():
+            shutil.copyfile(src, me)
+            os.execv(sys.executable, [sys.executable, me] + argv[1:])
+    except OSError:
+        pass  # keep running the current copy
+
+
 def main(argv):
     cfg = load_config()
+    update_self(cfg, argv)
     if not is_repo(cfg):
         print("Plus381 parts library is not set up (run Setup in the KiCad plugin).")
         return 1

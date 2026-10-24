@@ -28,13 +28,17 @@ def _script():
     plugin is updated or KiCad recreates the plugin's Python environment."""
     dest = app_dir() / "partsync.py"
     shutil.copyfile(Path(partsync.__file__), dest)
+    cfg = partsync.load_config()
+    cfg["plugin_partsync"] = str(Path(partsync.__file__).resolve())
+    partsync.save_config(cfg)
     return dest
 
 
 def refresh_script():
     """Keep the scheduler's copy of partsync.py in step with the installed plugin."""
     dest = app_dir() / "partsync.py"
-    if dest.exists() and dest.read_bytes() != Path(partsync.__file__).read_bytes():
+    if dest.exists() and (dest.read_bytes() != Path(partsync.__file__).read_bytes() or
+                          partsync.load_config().get("plugin_partsync") != str(Path(partsync.__file__).resolve())):
         _script()
 
 
