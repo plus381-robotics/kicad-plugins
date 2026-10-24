@@ -1,7 +1,9 @@
 """Install/remove the background job that keeps the parts library up to date.
 
 The job runs partsync.py every minute through the operating system's own
-scheduler, so the library stays current even when KiCad is closed:
+scheduler. partsync.py only syncs while KiCad is open (KiCad itself cannot
+start plugins in the background), so new parts arrive within a minute of
+opening KiCad and keep arriving while it runs:
   Windows: Task Scheduler (hidden window via wscript)
   macOS:   a LaunchAgent
   Linux:   a systemd user timer, or cron when systemd is not available
@@ -27,6 +29,13 @@ def _script():
     dest = app_dir() / "partsync.py"
     shutil.copyfile(Path(partsync.__file__), dest)
     return dest
+
+
+def refresh_script():
+    """Keep the scheduler's copy of partsync.py in step with the installed plugin."""
+    dest = app_dir() / "partsync.py"
+    if dest.exists() and dest.read_bytes() != Path(partsync.__file__).read_bytes():
+        _script()
 
 
 def _run(*cmd, check=True, input=None):

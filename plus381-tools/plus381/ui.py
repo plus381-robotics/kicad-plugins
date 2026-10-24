@@ -1,6 +1,7 @@
 """wxPython windows for the Plus381 Tools plugin."""
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -109,9 +110,7 @@ def do_setup(log, parts_dir, name, email, auto):
         if r.returncode != 0 or not (parts_dir / "categories.json").exists():
             shutil.rmtree(parts_dir, ignore_errors=True)  # don't leave a half download behind
             raise GitError("Could not download the parts library:\n" + (r.stderr or r.stdout).strip() +
-                           "\n\nMake sure you are logged in to GitHub with an account that is a member of "
-                           "plus381-robotics (e.g. sign in once in GitHub Desktop, or run 'git clone "
-                           f"{partsync.REPO_URL}' in a terminal and log in).")
+                           "\n\nCheck your internet connection and try again.")
         log("Download: ok")
 
     cfg = partsync.load_config()
@@ -185,8 +184,8 @@ class SetupDialog(wx.Dialog):
         g.Add(self.email, 1, wx.EXPAND)
         s.Add(g, 0, wx.EXPAND | wx.ALL, PAD)
 
-        self.auto = wx.CheckBox(p, label="Keep the library up to date automatically (checks every minute, "
-                                         "also when KiCad is closed)")
+        self.auto = wx.CheckBox(p, label="Keep the library up to date automatically while KiCad is open "
+                                         "(checks every minute)")
         self.auto.SetValue(True)
         s.Add(self.auto, 0, wx.ALL, PAD)
 
@@ -562,7 +561,13 @@ class PublishDialog(wx.Dialog):
         except Conflict as c:
             self.conflict(c)
         except Exception as e:  # noqa: BLE001
-            error(self, f"Publishing failed:\n{e}\n\nYour changes are saved locally; try again later.")
+            hint = ""
+            if re.search(r"auth|credential|permission|403|could not read username", str(e), re.I):
+                hint = ("\n\nGit is not logged in to GitHub, or your account can't write to "
+                        "plus381-robotics/kicad-parts. Log in once (GitHub Desktop, or run 'git push' in the "
+                        f"library folder {self.cfg['parts_dir']} in a terminal) and ask an admin to add you "
+                        "to the organisation if needed.")
+            error(self, f"Publishing failed:\n{e}{hint}\n\nYour changes are saved locally; try again later.")
         else:
             info(self, "Published. Everyone gets your changes within a minute.", "Published")
         self.refresh()
@@ -629,7 +634,7 @@ class StatusDialog(wx.Dialog):
             f"Contents:         {len(libs)} libraries, {n_sym} symbols, {n_fp} footprints, {n_3d} 3D models",
             f"Last sync:        {st.get('time', 'never')}  {'OK' if st.get('ok') else 'PROBLEM'}",
             f"Last new parts:   {st.get('last_update') or '-'}",
-            f"Background sync:  {'on (every minute)' if auto else 'OFF - library only updates when you use the plugin'}",
+            f"Background sync:  {'on (every minute while KiCad is open)' if auto else 'OFF - library only updates when you use the plugin'}",
             f"Path variable:    {'ok' if partsync.env_var_ok(cfg['parts_dir']) else 'not set yet - close KiCad completely and open it again'}",
             f"Unpublished:      {pending} change(s)",
         ]
@@ -687,6 +692,7 @@ def main(action):
         cfg = ensure_setup()
         if not cfg:
             return
+        autosync.refresh_script()
         if action != "setup":
             st = quick_sync(None, cfg)
             if not st.get("ok") and st.get("message"):

@@ -3,9 +3,12 @@
 
 This file only uses the Python standard library. It is imported by the
 Plus381 Tools plugin and is also copied to the user's config folder, where
-the operating system's scheduler runs it every minute:
+the operating system's scheduler runs it every minute. It only syncs while
+KiCad is open; when KiCad is closed it just makes sure KiCad's settings are
+complete and exits without touching the network:
 
     python partsync.py sync [--quiet]     get the newest parts, push unpublished ones
+    python partsync.py sync --always      sync even when KiCad is closed
     python partsync.py configure-kicad    write KiCad settings (waits until KiCad is closed)
 """
 
@@ -446,6 +449,11 @@ def main(argv):
         return 1
     cmd = argv[1] if len(argv) > 1 else "sync"
     if cmd == "sync":
+        if "--always" not in argv and not kicad_running():
+            # KiCad closed: nothing to sync for. This is also the moment the
+            # path variable can be written safely (KiCad rewrites it on close).
+            ensure_env_var(cfg["parts_dir"])
+            return 0
         st = run_sync(cfg, quiet="--quiet" in argv)
         return 0 if st.get("ok") else 1
     if cmd == "configure-kicad":

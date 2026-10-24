@@ -8,18 +8,18 @@ KiCad 10 plugins for the Plus381 Robotics team.
 
 ## Install (once per computer, about 5 minutes)
 
-You need **KiCad 10**, **Git with Git LFS**, and a GitHub account in the
-plus381-robotics organisation.
+You need **KiCad 10** and **Git with Git LFS**. To **publish** parts you also
+need a GitHub account in the plus381-robotics organisation. Downloading the
+library needs no account, since `kicad-parts` is public.
 
 * **Windows:** [Git for Windows](https://git-scm.com/download/win) (LFS is
   included) or GitHub Desktop.
 * **macOS:** `brew install git git-lfs`
 * **Linux:** install `git` and `git-lfs` from your package manager.
 
-1. **Log in to GitHub once** so Git can download the private parts library.
-   On Windows, Git opens a browser login the first time. Otherwise, sign in
-   with GitHub Desktop, or run `git clone https://github.com/plus381-robotics/kicad-parts`
-   once in a terminal and log in, then delete that folder.
+1. **To publish parts, log in to GitHub once.** On Windows, Git opens a
+   browser login on your first Publish. On macOS/Linux, sign in with GitHub
+   Desktop or set up a Git credential helper. Skip this if you only use parts.
 2. KiCad → **Preferences → Preferences → Plugins** → tick **Enable KiCad API**,
    then click OK.
 3. KiCad → **Plugin and Content Manager → Manage** (top right) → **+** and add
@@ -40,7 +40,7 @@ longer while KiCad prepares the plugin.
 
 | Task | How |
 |---|---|
-| Get new parts | Nothing to do. The library updates itself every minute, even when KiCad is closed. Reopen the footprint/symbol chooser to see new parts. |
+| Get new parts | Nothing to do. While KiCad is open, the library updates itself every minute (and right away whenever you click a Plus381 button). Reopen the footprint/symbol chooser to see new parts. |
 | Add a part | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip and a category → **Import** → open the footprint in the Footprint Editor, press `Alt+3`, fix the 3D model if needed and save → **Publish**. |
 | Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
 | See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
@@ -60,7 +60,10 @@ the other one.
 * **Background sync** is a job in your operating system's scheduler (Windows
   Task Scheduler, a macOS LaunchAgent, or a systemd user timer / cron on
   Linux). It runs `partsync.py` every minute with KiCad's own Python. It only
-  fast-forwards: it never overwrites files you are editing and never
+  syncs while KiCad is open: when KiCad is closed it exits immediately without
+  going online, so new parts arrive within a minute of opening KiCad. (KiCad
+  can't start plugins by itself on startup, which is why a scheduler job is
+  used.) It only fast-forwards: it never overwrites files you are editing and never
   publishes on its own, except for retrying a Publish that failed while
   you were offline. It also re-registers new categories and repairs the path
   variable if needed.
