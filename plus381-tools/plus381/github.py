@@ -21,7 +21,7 @@ from .partsync import _hidden, app_dir
 
 # OAuth App "Plus381 Tools" owned by the plus381-robotics organisation, with
 # Device Flow enabled. The client ID is public by design (no secret is used).
-CLIENT_ID = ""
+CLIENT_ID = "Ov23liVILoeUcEa0Nh1w"
 SCOPE = "public_repo"
 OWNER, REPO = "plus381-robotics", "kicad-parts"
 
