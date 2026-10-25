@@ -306,31 +306,23 @@ class ImportDialog(wx.Dialog):
         row("3D model:", self.model)
         s.Add(g, 0, wx.EXPAND | wx.ALL, PAD)
 
-        t = wx.FlexGridSizer(4, PAD, PAD)
+        t = wx.FlexGridSizer(5, PAD, PAD)
         t.Add(label(p, "3D offset (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.off = [wx.SpinCtrlDouble(p, min=-100, max=100, inc=0.05, size=(90, -1)) for _ in range(3)]
         for c in self.off:
             c.SetDigits(3)
             t.Add(c)
+        t.AddSpacer(0)
         t.Add(label(p, "3D rotation (deg):"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.rot = [wx.SpinCtrlDouble(p, min=-360, max=360, inc=90, size=(90, -1)) for _ in range(3)]
         for c in self.rot:
             c.SetDigits(1)
             t.Add(c)
+        self.reset = wx.Button(p, label="Vendor values")
+        self.reset.SetToolTip("Undo your changes: back to the offset/rotation from the download")
+        self.reset.Bind(wx.EVT_BUTTON, lambda e: self.vendor_values())
+        t.Add(self.reset, 0, wx.ALIGN_CENTER_VERTICAL)
         s.Add(t, 0, wx.ALL, PAD)
-        turn = wx.BoxSizer(wx.HORIZONTAL)
-        turn.Add(label(p, "Turn model:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, PAD)
-        self.turn_buttons = []
-        for text, axis in (("X +90", 0), ("Y +90", 1), ("Z +90", 2)):
-            btn = wx.Button(p, label=text, style=wx.BU_EXACTFIT)
-            btn.Bind(wx.EVT_BUTTON, lambda e, a=axis: self.turn(a))
-            turn.Add(btn, 0, wx.RIGHT, 4)
-            self.turn_buttons.append(btn)
-        reset = wx.Button(p, label="Vendor values", style=wx.BU_EXACTFIT)
-        reset.Bind(wx.EVT_BUTTON, lambda e: self.on_footprint())
-        turn.Add(reset, 0, wx.LEFT, PAD)
-        self.turn_buttons.append(reset)
-        s.Add(turn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, PAD)
         s.Add(label(p, "Offset/rotation start as the vendor set them. Adjust them until the preview on the "
                        "right looks right (pins on the pads, part flat on the board).", wrap=620),
               0, wx.LEFT | wx.RIGHT, PAD)
@@ -390,7 +382,7 @@ class ImportDialog(wx.Dialog):
 
     def enable(self, on):
         for c in (self.cat, self.sym, self.sym_name, self.fp, self.fp_name, self.mpn, self.mfr, self.ds,
-                  self.model, self.replace, self.go, *self.off, *self.rot, *self.turn_buttons):
+                  self.model, self.replace, self.go, *self.off, *self.rot, self.reset):
             c.Enable(on)
 
     def on_destroy(self, e):
@@ -463,21 +455,21 @@ class ImportDialog(wx.Dialog):
             self.fp_name.SetValue(importer.safe_name(fp.name))
             m = importer.guess_model(self.dl, fp)
             self.model.SetSelection(self.dl.models.index(m) if m else len(self.dl.models))
+        self.vendor_values()
+        self.validate()
+
+    def vendor_values(self):
+        """Offset/rotation as the vendor's footprint has them."""
+        _, fp, _ = self.current()
+        if fp:
             off, rot = importer.model_transform(fp)
             for c, v in zip(self.off + self.rot, off + rot):
                 c.SetValue(v)
-        self.validate()
         self.schedule_preview()
 
     # ---- 3D preview
 
     PREVIEW_SIZE = (260, 200)
-
-    def turn(self, axis):
-        c = self.rot[axis]
-        v = c.GetValue() + 90
-        c.SetValue(v - 360 if v > 180 else v)
-        self.schedule_preview()
 
     def schedule_preview(self):
         """Re-render shortly after the last change (typing fires many events)."""

@@ -38,7 +38,7 @@ longer while KiCad prepares the plugin.
 | Task | How |
 |---|---|
 | Get new parts | Nothing to do. While KiCad is open, the library updates itself every minute (and right away whenever you click a Plus381 button). Reopen the footprint/symbol chooser to see new parts. |
-| Add a part | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip and a category → check the **3D preview** (fix offset/rotation, *Turn model* buttons for 90° steps) → **Import** → **Publish**. |
+| Add a part | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip and a category → check the **3D preview** (fix offset/rotation; **Vendor values** undoes your changes) → **Import** → **Publish**. |
 | Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
 | See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
 
