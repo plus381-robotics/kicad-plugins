@@ -4,12 +4,14 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import traceback
 import webbrowser
 from pathlib import Path
 
 import wx
+import wx.adv
 
 from . import autosync, github, importer, partsync, publish
 from .partsync import Conflict, GitError
@@ -251,6 +253,37 @@ def ensure_setup(parent=None):
 # Import
 # --------------------------------------------------------------------------
 
+class CategoryCombo(wx.adv.OwnerDrawnComboBox):
+    """Category drop-down whose list shows each category's description under
+    its name, so you can see what belongs where while choosing."""
+
+    def __init__(self, parent, cats):
+        self.cats = cats
+        super().__init__(parent, choices=list(cats), style=wx.CB_READONLY, size=(170, -1))
+        self.SetPopupMinWidth(560)
+
+    def OnDrawItem(self, dc, rect, item, flags):
+        if item == wx.NOT_FOUND:
+            return
+        name = self.GetString(item)
+        if flags & wx.adv.ODCB_PAINTING_CONTROL:  # the closed control: name only
+            dc.DrawText(name, rect.x + 4, rect.y + (rect.height - dc.GetCharHeight()) // 2)
+            return
+        font = self.GetFont()
+        dc.SetFont(font.Bold())
+        dc.DrawText(name, rect.x + 6, rect.y + 3)
+        dc.SetFont(font.Smaller())
+        if not flags & wx.adv.ODCB_PAINTING_SELECTED:
+            dc.SetTextForeground(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        dc.DrawText(self.cats.get(name, ""), rect.x + 6, rect.y + 3 + dc.GetCharHeight() + 4)
+
+    def OnMeasureItem(self, item):
+        return self.GetCharHeight() * 2 + 12
+
+    def OnMeasureItemWidth(self, item):
+        return 560
+
+
 class ImportDialog(wx.Dialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent, title=f"{TITLE}: Import part",
@@ -270,8 +303,22 @@ class ImportDialog(wx.Dialog):
         folder = wx.Button(p, label="Folder...")
         top.Add(folder, 0, wx.LEFT, PAD)
         s.Add(top, 0, wx.EXPAND | wx.ALL, PAD)
-        self.found = label(p, "Download a part's KiCad files from SnapEDA, Mouser, UltraLibrarian, DigiKey, ... "
-                              "and pick the zip here.", wrap=620)
+        num = wx.BoxSizer(wx.HORIZONTAL)
+        num.Add(label(p, "or part number:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, PAD)
+        self.number = wx.TextCtrl(p, style=wx.TE_PROCESS_ENTER, size=(170, -1))
+        self.number.SetHint("C8734 or STM32F103C8T6")
+        num.Add(self.number, 0, wx.RIGHT, PAD)
+        lcsc = wx.Button(p, label="Get from LCSC")
+        lcsc.SetToolTip("LCSC numbers (C...) are imported automatically: symbol, footprint and 3D model. "
+                        "Any other part number opens the LCSC search so you can find its C number.")
+        digikey = wx.Button(p, label="Find on DigiKey")
+        digikey.SetToolTip("Opens DigiKey. On the part's page use 'EDA/CAD Models' to download the KiCad zip, "
+                           "then pick it above.")
+        num.Add(lcsc, 0, wx.RIGHT, PAD)
+        num.Add(digikey)
+        s.Add(num, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, PAD)
+        self.found = label(p, "Pick a vendor zip (SnapEDA, Mouser, UltraLibrarian, DigiKey, ...) or enter an LCSC "
+                              "part number.", wrap=620)
         s.Add(self.found, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, PAD)
 
         g = wx.FlexGridSizer(2, PAD, PAD)
@@ -282,7 +329,7 @@ class ImportDialog(wx.Dialog):
             g.Add(ctrl, 1, wx.EXPAND)
 
         cat_row = wx.BoxSizer(wx.HORIZONTAL)
-        self.cat = wx.Choice(p, choices=list(self.cats))
+        self.cat = CategoryCombo(p, self.cats)
         self.cat.SetSelection(list(self.cats).index("Misc") if "Misc" in self.cats else 0)
         self.cat_descr = label(p, "")
         cat_row.Add(self.cat, 0, wx.RIGHT, PAD)
@@ -343,7 +390,7 @@ class ImportDialog(wx.Dialog):
         pv.Add(label(p, "3D preview", bold=True), 0, wx.BOTTOM, 4)
         grid = wx.GridSizer(2, 2, 4, 4)
         self.views = {}
-        blank = wx.Bitmap(*self.PREVIEW_SIZE)
+        blank = self.blank_bitmap()
         for name in importer.PREVIEW_VIEWS:
             cell = wx.BoxSizer(wx.VERTICAL)
             cell.Add(label(p, name), 0)
@@ -364,13 +411,16 @@ class ImportDialog(wx.Dialog):
         self.preview_timer = None
 
         self.file.Bind(wx.EVT_FILEPICKER_CHANGED, self.on_file)
+        lcsc.Bind(wx.EVT_BUTTON, self.on_lcsc)
+        self.number.Bind(wx.EVT_TEXT_ENTER, self.on_lcsc)
+        digikey.Bind(wx.EVT_BUTTON, self.on_digikey)
         folder.Bind(wx.EVT_BUTTON, self.on_folder)
         self.sym.Bind(wx.EVT_CHOICE, lambda e: self.on_symbol())
         self.fp.Bind(wx.EVT_CHOICE, lambda e: self.on_footprint())
         for ctrl in (self.sym_name, self.fp_name):
             ctrl.Bind(wx.EVT_TEXT, lambda e: self.validate())
         self.replace.Bind(wx.EVT_CHECKBOX, lambda e: self.validate())
-        self.cat.Bind(wx.EVT_CHOICE, lambda e: self.validate())
+        self.cat.Bind(wx.EVT_COMBOBOX, lambda e: self.validate())
         self.model.Bind(wx.EVT_CHOICE, lambda e: self.schedule_preview())
         for c in self.off + self.rot:
             c.Bind(wx.EVT_SPINCTRLDOUBLE, lambda e: self.schedule_preview())
@@ -386,8 +436,11 @@ class ImportDialog(wx.Dialog):
             c.Enable(on)
 
     def on_destroy(self, e):
-        if e.GetEventObject() is self and self.dl:
-            self.dl.cleanup()
+        if e.GetEventObject() is self:
+            if self.dl:
+                self.dl.cleanup()
+            if getattr(self, "lcsc_dir", None):
+                shutil.rmtree(self.lcsc_dir, ignore_errors=True)
         e.Skip()
 
     def on_file(self, _):
@@ -396,6 +449,35 @@ class ImportDialog(wx.Dialog):
         if path.lower().endswith(".zip") and os.path.isfile(path) and path != getattr(self, "loaded", None):
             self.loaded = path
             self.load(path)
+
+    def on_lcsc(self, _):
+        number = self.number.GetValue().strip()
+        if not number:
+            return
+        if not importer.LCSC_RE.match(number):
+            webbrowser.open(importer.search_urls(number)["lcsc"])
+            info(self, f"'{number}' isn't an LCSC number, so the LCSC search opened in your browser.\n\n"
+                       "Copy the part's LCSC number (C...) from there and paste it here.", "Find the LCSC number")
+            return
+        self.lcsc_dir = getattr(self, "lcsc_dir", None) or Path(tempfile.mkdtemp(prefix="plus381-lcsc-"))
+        try:
+            folder = run_busy(self, f"Downloading {number.upper()} from LCSC/EasyEDA...",
+                              importer.fetch_lcsc, number, self.lcsc_dir)
+        except Exception as e:  # noqa: BLE001
+            error(self, e, "LCSC import failed")
+            return
+        self.file.SetPath("")
+        self.load(str(folder))
+
+    def on_digikey(self, _):
+        number = self.number.GetValue().strip()
+        if not number:
+            error(self, "Enter the manufacturer or DigiKey part number first.", "Part number missing")
+            return
+        webbrowser.open(importer.search_urls(number)["digikey"])
+        info(self, "DigiKey opened in your browser. On the part's page click 'EDA/CAD Models', download the "
+                   "KiCad version (free DigiKey/Ultra Librarian/SnapMagic login), then pick the zip at the "
+                   "top of this window.", "Download from DigiKey")
 
     def on_folder(self, _):
         with wx.DirDialog(self, "Folder with the unzipped vendor files") as d:
@@ -470,6 +552,14 @@ class ImportDialog(wx.Dialog):
     # ---- 3D preview
 
     PREVIEW_SIZE = (260, 200)
+
+    def blank_bitmap(self):
+        bmp = wx.Bitmap(*self.PREVIEW_SIZE)
+        dc = wx.MemoryDC(bmp)
+        dc.SetBackground(wx.Brush(wx.Colour(225, 225, 228)))
+        dc.Clear()
+        dc.SelectObject(wx.NullBitmap)
+        return bmp
 
     def schedule_preview(self):
         """Re-render shortly after the last change (typing fires many events)."""
@@ -564,7 +654,7 @@ class ImportDialog(wx.Dialog):
         self.dl = None
         self.file.SetPath("")
         self.enable(False)
-        blank = wx.Bitmap(*self.PREVIEW_SIZE)
+        blank = self.blank_bitmap()
         for bmp in self.views.values():
             bmp.SetBitmap(blank)
         self.found.SetLabel("Pick the next zip, or close this window.")

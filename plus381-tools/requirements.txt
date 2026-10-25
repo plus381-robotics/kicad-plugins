@@ -1,2 +1,3 @@
-# No extra packages: the plugin only uses the Python standard library and the
-# wxPython that ships with KiCad.
+# Everything else is the Python standard library and the wxPython that ships
+# with KiCad. easyeda2kicad (AGPL-3.0, no dependencies) converts LCSC parts.
+easyeda2kicad==1.0.1

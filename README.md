@@ -38,7 +38,9 @@ longer while KiCad prepares the plugin.
 | Task | How |
 |---|---|
 | Get new parts | Nothing to do. While KiCad is open, the library updates itself every minute (and right away whenever you click a Plus381 button). Reopen the footprint/symbol chooser to see new parts. |
-| Add a part | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip and a category → check the **3D preview** (fix offset/rotation; **Vendor values** undoes your changes) → **Import** → **Publish**. |
+| Add a part from LCSC | **Import part** → type the LCSC number (e.g. `C8734`) → **Get from LCSC** (or Enter). Symbol, footprint and 3D model are downloaded and converted automatically (via [easyeda2kicad](https://github.com/uPesy/easyeda2kicad.py)); the `LCSC Part` field is kept for JLCPCB assembly. Typing a manufacturer part number instead opens the LCSC search so you can find the C number. |
+| Add a part from a vendor zip | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip. **Find on DigiKey** opens DigiKey for a part number; there, *EDA/CAD Models* downloads the KiCad zip (needs a free login; DigiKey has no API for CAD files). |
+| Then, for both | Pick a category (each shows its description) → check the **3D preview** (fix offset/rotation; **Vendor values** undoes your changes) → **Import** → **Publish**. |
 | Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
 | See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
 
@@ -91,7 +93,9 @@ has **Log in to GitHub** / **Log out** buttons.
   and top views) is rendered by `kicad-cli pcb render` on a tiny temporary
   board holding just the part, so it shows exactly what KiCad will show. The
   first render reads the STEP file and takes a few seconds; after that,
-  changes update in about a second.
+  changes update in about a second. The preview uses its own KiCad settings
+  folder in which all model types (SMD, through-hole, virtual) are shown,
+  whatever your 3D viewer is set to.
 * Projects reference parts as `Plus381_<Category>:<Name>`. KiCad also keeps a
   copy of every part inside the schematic/board, so editing a part never
   changes existing boards until someone runs *Update from Library*.

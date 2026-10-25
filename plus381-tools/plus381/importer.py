@@ -13,7 +13,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .partsync import LIB_PREFIX, VAR, _hidden
+from .partsync import LIB_PREFIX, VAR, _hidden, app_dir
 
 MODEL_EXTS = (".step", ".stp", ".stpz", ".step.gz", ".stp.gz", ".wrl")
 
@@ -291,6 +291,11 @@ def guess_model(dl, fp):
         want = _norm(os.path.basename(unq(m.group(1))))
         for model in dl.models:
             if _norm(model.name) == want:
+                if model.name.lower().endswith(".wrl"):
+                    # A STEP next to the VRML is the better model (MCAD export).
+                    for alt in dl.models:
+                        if _model_stem(alt) == _model_stem(model) and not alt.name.lower().endswith(".wrl"):
+                            return alt
                 return model
     steps = [m for m in dl.models if not m.name.lower().endswith(".wrl")] or dl.models
     key = _norm(fp.name)
@@ -314,9 +319,11 @@ def symbol_defaults(sym):
                 return v
         return ""
     ds = get_prop(sym.block, "Datasheet") or ""
+    # LCSC/EasyEDA adds the Chinese name in brackets: "ST(意法半导体)" -> "ST"
+    mfr = re.sub(r"\s*[(（][^)）]*[\u3000-\u9fff][^)）]*[)）]", "", first(MFR_FIELDS)).strip()
     return {
         "mpn": first(MPN_FIELDS) or sym.name,
-        "manufacturer": first(MFR_FIELDS),
+        "manufacturer": mfr,
         "datasheet": "" if ds == "~" else ds,
     }
 
@@ -565,6 +572,32 @@ def preview_board(fp_text, path):
         ' (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts"))\n)\n', encoding="utf-8")
 
 
+def _preview_env():
+    """kicad-cli takes 3D viewer options from the user's KiCad settings (for
+    example "show through-hole models" may be off). Give it a private settings
+    folder where every kind of part is shown, without touching the user's."""
+    base = app_dir() / "preview-kicad-config"
+    for d in [base / "10.0"] + [base / p.name for p in partsync_config_dirs()]:
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "3d_viewer.json"
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        render = data.setdefault("render", {})
+        for key in ("show_footprints_normal", "show_footprints_insert", "show_footprints_virtual",
+                    "show_footprints_not_in_posfile", "show_footprints_dnp", "show_board_body"):
+            render[key] = True
+        render["show_fp_references"] = render["show_fp_values"] = render["show_fp_text"] = False
+        f.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return dict(os.environ, KICAD_CONFIG_HOME=str(base))
+
+
+def partsync_config_dirs():
+    from .partsync import kicad_config_dirs
+    return kicad_config_dirs()
+
+
 def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=None, on_view=None):
     """Render the footprint with its 3D model from several sides using
     kicad-cli. Calls on_view(name, png_path) as each view finishes."""
@@ -578,15 +611,51 @@ def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=N
     board = outdir / "preview.kicad_pcb"
     preview_board(text, board)
     results = {}
+    env = _preview_env()
     for name in views or PREVIEW_VIEWS:
         png = outdir / f"{name}.png"
         if png.exists():
             png.unlink()
         r = subprocess.run([cli, "pcb", "render", str(board), "-o", str(png), "-w", str(size[0]),
                             "-h", str(size[1]), "--background", "opaque", "--zoom", "0.9",
-                            *PREVIEW_VIEWS[name]], capture_output=True, text=True, **_hidden())
+                            *PREVIEW_VIEWS[name]], capture_output=True, text=True, env=env, **_hidden())
         if r.returncode == 0 and png.exists():
             results[name] = png
             if on_view:
                 on_view(name, png)
     return results
+
+
+# --------------------------------------------------------------------------
+# Parts by number
+# --------------------------------------------------------------------------
+
+LCSC_RE = re.compile(r"^C\d{1,9}$", re.I)
+
+
+def fetch_lcsc(lcsc_id, outdir):
+    """Download symbol, footprint and 3D model for an LCSC part number (e.g.
+    C8734) with easyeda2kicad. Returns the folder to give to analyze()."""
+    lcsc_id = lcsc_id.strip().upper()
+    if not LCSC_RE.match(lcsc_id):
+        raise ValueError(f"'{lcsc_id}' is not an LCSC part number (they look like C8734).")
+    out = Path(outdir) / lcsc_id
+    out.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([sys.executable, "-m", "easyeda2kicad", "--full", "--lcsc_id", lcsc_id,
+                        "--output", str(out / "lcsc.kicad_sym")], cwd=str(out), capture_output=True,
+                       text=True, timeout=180, **_hidden())
+    text = (r.stdout + r.stderr)
+    if "No module named easyeda2kicad" in text:
+        raise RuntimeError("The LCSC converter (easyeda2kicad) isn't installed. Update Plus381 Tools in the "
+                           "Plugin and Content Manager and restart KiCad (it needs internet the first time).")
+    if not any(out.rglob("*.kicad_mod")) and not any(out.rglob("*.kicad_sym")):
+        errors = [l for l in text.splitlines() if "ERROR" in l] or text.strip().splitlines()[-3:]
+        raise RuntimeError(f"LCSC/EasyEDA has no KiCad data for {lcsc_id}:\n" + "\n".join(errors))
+    return out
+
+
+def search_urls(query):
+    from urllib.parse import quote_plus
+    q = quote_plus(query.strip())
+    return {"lcsc": f"https://www.lcsc.com/search?q={q}",
+            "digikey": f"https://www.digikey.com/en/products/result?keywords={q}"}
