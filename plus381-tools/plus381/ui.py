@@ -318,8 +318,22 @@ class ImportDialog(wx.Dialog):
             c.SetDigits(1)
             t.Add(c)
         s.Add(t, 0, wx.ALL, PAD)
-        s.Add(label(p, "Offset/rotation start as the vendor set them. Check the result once in the Footprint "
-                       "Editor (Alt+3) and fix it there if needed.", wrap=620), 0, wx.LEFT | wx.RIGHT, PAD)
+        turn = wx.BoxSizer(wx.HORIZONTAL)
+        turn.Add(label(p, "Turn model:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, PAD)
+        self.turn_buttons = []
+        for text, axis in (("X +90", 0), ("Y +90", 1), ("Z +90", 2)):
+            btn = wx.Button(p, label=text, style=wx.BU_EXACTFIT)
+            btn.Bind(wx.EVT_BUTTON, lambda e, a=axis: self.turn(a))
+            turn.Add(btn, 0, wx.RIGHT, 4)
+            self.turn_buttons.append(btn)
+        reset = wx.Button(p, label="Vendor values", style=wx.BU_EXACTFIT)
+        reset.Bind(wx.EVT_BUTTON, lambda e: self.on_footprint())
+        turn.Add(reset, 0, wx.LEFT, PAD)
+        self.turn_buttons.append(reset)
+        s.Add(turn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, PAD)
+        s.Add(label(p, "Offset/rotation start as the vendor set them. Adjust them until the preview on the "
+                       "right looks right (pins on the pads, part flat on the board).", wrap=620),
+              0, wx.LEFT | wx.RIGHT, PAD)
 
         self.replace = wx.CheckBox(p, label="Replace existing part with the same name")
         s.Add(self.replace, 0, wx.ALL, PAD)
@@ -331,9 +345,31 @@ class ImportDialog(wx.Dialog):
         b.Add(self.go, 0, wx.RIGHT, PAD)
         b.Add(wx.Button(p, wx.ID_CANCEL, label="Close"))
         s.Add(b, 0, wx.ALIGN_RIGHT | wx.ALL, PAD)
-        p.SetSizer(s)
-        s.Fit(self)
+
+        # 3D preview, rendered by kicad-cli (wx has no STEP viewer).
+        pv = wx.BoxSizer(wx.VERTICAL)
+        pv.Add(label(p, "3D preview", bold=True), 0, wx.BOTTOM, 4)
+        grid = wx.GridSizer(2, 2, 4, 4)
+        self.views = {}
+        blank = wx.Bitmap(*self.PREVIEW_SIZE)
+        for name in importer.PREVIEW_VIEWS:
+            cell = wx.BoxSizer(wx.VERTICAL)
+            cell.Add(label(p, name), 0)
+            bmp = wx.StaticBitmap(p, bitmap=blank)
+            cell.Add(bmp, 0)
+            grid.Add(cell)
+            self.views[name] = bmp
+        pv.Add(grid, 0)
+        self.preview_status = label(p, "Pick a zip to see the part in 3D.")
+        pv.Add(self.preview_status, 0, wx.TOP, 4)
+        outer = wx.BoxSizer(wx.HORIZONTAL)
+        outer.Add(s, 1, wx.EXPAND)
+        outer.Add(pv, 0, wx.ALL, PAD)
+        p.SetSizer(outer)
+        outer.Fit(self)
         self.SetMinSize(self.GetSize())
+        self.preview_gen = 0
+        self.preview_timer = None
 
         self.file.Bind(wx.EVT_FILEPICKER_CHANGED, self.on_file)
         folder.Bind(wx.EVT_BUTTON, self.on_folder)
@@ -343,7 +379,10 @@ class ImportDialog(wx.Dialog):
             ctrl.Bind(wx.EVT_TEXT, lambda e: self.validate())
         self.replace.Bind(wx.EVT_CHECKBOX, lambda e: self.validate())
         self.cat.Bind(wx.EVT_CHOICE, lambda e: self.validate())
-        self.SetSize((700, -1))
+        self.model.Bind(wx.EVT_CHOICE, lambda e: self.schedule_preview())
+        for c in self.off + self.rot:
+            c.Bind(wx.EVT_SPINCTRLDOUBLE, lambda e: self.schedule_preview())
+            c.Bind(wx.EVT_TEXT, lambda e: self.schedule_preview())
         self.go.Bind(wx.EVT_BUTTON, self.on_import)
         self.Bind(wx.EVT_WINDOW_DESTROY, self.on_destroy)
         self.enable(False)
@@ -351,7 +390,7 @@ class ImportDialog(wx.Dialog):
 
     def enable(self, on):
         for c in (self.cat, self.sym, self.sym_name, self.fp, self.fp_name, self.mpn, self.mfr, self.ds,
-                  self.model, self.replace, self.go, *self.off, *self.rot):
+                  self.model, self.replace, self.go, *self.off, *self.rot, *self.turn_buttons):
             c.Enable(on)
 
     def on_destroy(self, e):
@@ -428,6 +467,63 @@ class ImportDialog(wx.Dialog):
             for c, v in zip(self.off + self.rot, off + rot):
                 c.SetValue(v)
         self.validate()
+        self.schedule_preview()
+
+    # ---- 3D preview
+
+    PREVIEW_SIZE = (260, 200)
+
+    def turn(self, axis):
+        c = self.rot[axis]
+        v = c.GetValue() + 90
+        c.SetValue(v - 360 if v > 180 else v)
+        self.schedule_preview()
+
+    def schedule_preview(self):
+        """Re-render shortly after the last change (typing fires many events)."""
+        if not self.dl:
+            return
+        if self.preview_timer and self.preview_timer.IsRunning():
+            self.preview_timer.Stop()
+        self.preview_timer = wx.CallLater(400, self.start_preview)
+
+    def start_preview(self):
+        _, fp, model = self.current()
+        if not fp or not self.dl:
+            self.preview_status.SetLabel("No footprint selected.")
+            return
+        self.preview_gen += 1
+        gen = self.preview_gen
+        args = (fp, model, [c.GetValue() for c in self.off], [c.GetValue() for c in self.rot],
+                self.dl.tmp / "preview" / str(gen), self.PREVIEW_SIZE)
+        self.preview_status.SetLabel("Rendering..." if gen > 1 else
+                                     "Rendering (the first time takes a few seconds)...")
+
+        def work():
+            try:
+                importer.render_preview(*args, on_view=lambda n, png: wx.CallAfter(self.show_view, gen, n, png))
+                wx.CallAfter(self.preview_done, gen, None)
+            except Exception as e:  # noqa: BLE001 - preview is optional
+                wx.CallAfter(self.preview_done, gen, e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_view(self, gen, name, png):
+        if gen != self.preview_gen or not self:
+            return  # an older render finished after a newer one started
+        img = wx.Image(str(png))
+        if img.IsOk():
+            self.views[name].SetBitmap(img.ConvertToBitmap())
+
+    def preview_done(self, gen, err):
+        if gen != self.preview_gen or not self:
+            return
+        _, _, model = self.current()
+        if err:
+            self.preview_status.SetLabel(f"No preview: {err}")
+        elif not model:
+            self.preview_status.SetLabel("No 3D model selected: showing pads only.")
+        else:
+            self.preview_status.SetLabel("Up to date.")
 
     def choices(self):
         sym, fp, model = self.current()
@@ -468,15 +564,17 @@ class ImportDialog(wx.Dialog):
         if nick not in self.known_libs:
             lines.append(f"\n{nick} is a new library: close KiCad completely and open it again to see it.")
         msg = ("Imported into the library on this computer:\n" + "\n".join(lines) +
-               f"\n\nNext:\n1. Footprint Editor: open {nick} > {c.footprint_name or '-'}, press Alt+3 and check "
-               "the 3D model. Fix it in Footprint Properties > 3D Models if needed and save.\n"
-               "2. Click 'Publish' in the Plus381 toolbar to share it with the team.\n\n"
+               "\n\nNext: click 'Publish' in the Plus381 toolbar to share it with the team. "
+               "(To change it later, edit it in the Symbol/Footprint Editor and Publish again.)\n\n"
                "If the part doesn't appear in KiCad yet, reopen the symbol/footprint chooser.")
         info(self, msg, "Part imported")
         self.dl.cleanup()
         self.dl = None
         self.file.SetPath("")
         self.enable(False)
+        blank = wx.Bitmap(*self.PREVIEW_SIZE)
+        for bmp in self.views.values():
+            bmp.SetBitmap(blank)
         self.found.SetLabel("Pick the next zip, or close this window.")
 
 

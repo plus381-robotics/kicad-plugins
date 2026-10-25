@@ -378,14 +378,17 @@ def install_model(parts_dir, model, fp_name):
     return name
 
 
-def build_footprint(fp, name, model_name, offset, rotation):
+def build_footprint(fp, name, model_name, offset, rotation, model_path=None):
+    """The footprint as it will be saved. model_path overrides the model
+    reference (the preview uses the file's real location)."""
     text = fp.text.lstrip()
     text = re.sub(r'^\((?:footprint|module)\s+"?(?:[^"\\\s]|\\.)*"?', lambda _: "(footprint " + q(name), text, count=1)
     for s, e in reversed(child_blocks(text, "model")):
         line_start = text.rfind("\n", 0, s) + 1
         text = text[:line_start] + text[e:].lstrip(" \t").lstrip("\n")
-    if model_name:
-        model = (f"\t(model {q('${%s}/3dmodels/%s' % (VAR, model_name))}\n"
+    if model_name or model_path:
+        ref = model_path or "${%s}/3dmodels/%s" % (VAR, model_name)
+        model = (f"\t(model {q(ref)}\n"
                  f"\t\t(offset\n\t\t\t(xyz {' '.join(fmt(v) for v in offset)})\n\t\t)\n"
                  f"\t\t(scale\n\t\t\t(xyz 1 1 1)\n\t\t)\n"
                  f"\t\t(rotate\n\t\t\t(xyz {' '.join(fmt(v) for v in rotation)})\n\t\t)\n\t)\n")
@@ -507,3 +510,83 @@ def _normalise_footprint(path):
                 shutil.copyfile(out, path)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# 3D preview
+# --------------------------------------------------------------------------
+
+PREVIEW_VIEWS = {  # name: kicad-cli render arguments
+    "3D": ["--side", "top", "--rotate", "-45,0,45"],
+    "Front": ["--side", "front"],
+    "Right": ["--side", "right"],
+    "Top": ["--side", "top"],
+}
+
+
+def _bbox(text):
+    """Rough extent of a footprint (pads and graphics, not texts) in mm."""
+    xs, ys = [], []
+    for m in re.finditer(r'\((?:start|end|center|mid|xy)\s+([-\d.]+)\s+([-\d.]+)\)', text):
+        xs.append(float(m.group(1)))
+        ys.append(float(m.group(2)))
+    for pad in child_blocks(text, "pad"):
+        b = text[pad[0]:pad[1]]
+        at = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)', b)
+        size = re.search(r'\(size\s+([-\d.]+)\s+([-\d.]+)\)', b)
+        if at:
+            x, y = float(at.group(1)), float(at.group(2))
+            w, h = (float(size.group(1)), float(size.group(2))) if size else (0, 0)
+            r = max(w, h) / 2
+            xs += [x - r, x + r]
+            ys += [y - r, y + r]
+    if not xs:
+        return -2.5, -2.5, 2.5, 2.5
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def preview_board(fp_text, path):
+    """A tiny board holding only this footprint, to render it in 3D."""
+    text = fp_text.strip()
+    # Hide reference/value texts: they only clutter the preview.
+    text = re.sub(r'(\(property\s+"(?:Reference|Value)"\s+"(?:[^"\\]|\\.)*")', r'\1 (hide yes)', text)
+    body = text[text.index("\n") + 1:text.rfind(")")]
+    x0, y0, x1, y1 = _bbox(text)
+    margin = max(1.0, 0.15 * max(x1 - x0, y1 - y0))
+    cx, cy = 100, 100
+    path.write_text(
+        '(kicad_pcb (version 20260206) (generator "plus381_preview") (generator_version "10.0")\n'
+        ' (general (thickness 1.6)) (paper "A4")\n'
+        ' (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (1 "F.Mask" user) (3 "B.Mask" user)'
+        ' (5 "F.SilkS" user) (7 "B.SilkS" user) (13 "F.Paste" user) (15 "B.Paste" user)'
+        ' (25 "Edge.Cuts" user) (31 "F.CrtYd" user) (35 "F.Fab" user))\n'
+        f' (footprint "preview:part" (layer "F.Cu") (at {cx} {cy})\n{body})\n'
+        f' (gr_rect (start {cx + x0 - margin:.3f} {cy + y0 - margin:.3f}) (end {cx + x1 + margin:.3f} {cy + y1 + margin:.3f})'
+        ' (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts"))\n)\n', encoding="utf-8")
+
+
+def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=None, on_view=None):
+    """Render the footprint with its 3D model from several sides using
+    kicad-cli. Calls on_view(name, png_path) as each view finishes."""
+    cli = find_kicad_cli()
+    if not cli:
+        raise RuntimeError("kicad-cli not found, so no 3D preview.")
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    text = build_footprint(fp, "preview", None, offset, rotation,
+                           model_path=Path(model).resolve().as_posix() if model else None)
+    board = outdir / "preview.kicad_pcb"
+    preview_board(text, board)
+    results = {}
+    for name in views or PREVIEW_VIEWS:
+        png = outdir / f"{name}.png"
+        if png.exists():
+            png.unlink()
+        r = subprocess.run([cli, "pcb", "render", str(board), "-o", str(png), "-w", str(size[0]),
+                            "-h", str(size[1]), "--background", "opaque", "--zoom", "0.9",
+                            *PREVIEW_VIEWS[name]], capture_output=True, text=True, **_hidden())
+        if r.returncode == 0 and png.exists():
+            results[name] = png
+            if on_view:
+                on_view(name, png)
+    return results

@@ -38,7 +38,7 @@ longer while KiCad prepares the plugin.
 | Task | How |
 |---|---|
 | Get new parts | Nothing to do. While KiCad is open, the library updates itself every minute (and right away whenever you click a Plus381 button). Reopen the footprint/symbol chooser to see new parts. |
-| Add a part | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip and a category → **Import** → open the footprint in the Footprint Editor, press `Alt+3`, fix the 3D model if needed and save → **Publish**. |
+| Add a part | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip and a category → check the **3D preview** (fix offset/rotation, *Turn model* buttons for 90° steps) → **Import** → **Publish**. |
 | Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
 | See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
 
@@ -87,7 +87,11 @@ has **Log in to GitHub** / **Log out** buttons.
   `kicad-cli`. It stores the symbol and footprint as one file each (so two
   people adding parts never conflict) and links symbol → footprint → 3D
   model. It reuses an identical 3D model instead of storing a second copy, and
-  keeps the vendor's 3D offset and rotation.
+  keeps the vendor's 3D offset and rotation. The 3D preview (3D, front, right
+  and top views) is rendered by `kicad-cli pcb render` on a tiny temporary
+  board holding just the part, so it shows exactly what KiCad will show. The
+  first render reads the STEP file and takes a few seconds; after that,
+  changes update in about a second.
 * Projects reference parts as `Plus381_<Category>:<Name>`. KiCad also keeps a
   copy of every part inside the schematic/board, so editing a part never
   changes existing boards until someone runs *Update from Library*.
