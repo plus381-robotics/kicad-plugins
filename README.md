@@ -40,7 +40,7 @@ longer while KiCad prepares the plugin.
 | Get new parts | Nothing to do. While KiCad is open, the library updates itself every minute (and right away whenever you click a Plus381 button). Reopen the footprint/symbol chooser to see new parts. |
 | Add a part from LCSC | **Import part** → type the LCSC number (e.g. `C8734`) → **Get from LCSC** (or Enter). Symbol, footprint and 3D model are downloaded and converted automatically (via [easyeda2kicad](https://github.com/uPesy/easyeda2kicad.py)); the `LCSC Part` field is kept for JLCPCB assembly. Typing a manufacturer part number instead opens the LCSC search so you can find the C number. |
 | Add a part from a vendor zip | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip. **Find on DigiKey** opens DigiKey for a part number; there, *EDA/CAD Models* downloads the KiCad zip (needs a free login; DigiKey has no API for CAD files). |
-| Then, for both | Pick a category (each shows its description) → check the **3D preview** (fix offset/rotation; **Vendor values** undoes your changes) → **Import** → **Publish**. |
+| Then, for both | Pick a category (each shows its description) → check the **preview** (symbol, footprint and 3D from four sides; fix the 3D offset/rotation, **Vendor values** undoes your changes) → **Import** → **Publish**. |
 | Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
 | See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
 

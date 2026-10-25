@@ -12,6 +12,7 @@ from pathlib import Path
 
 import wx
 import wx.adv
+import wx.svg
 
 from . import autosync, github, importer, partsync, publish
 from .partsync import Conflict, GitError
@@ -387,11 +388,11 @@ class ImportDialog(wx.Dialog):
 
         # 3D preview, rendered by kicad-cli (wx has no STEP viewer).
         pv = wx.BoxSizer(wx.VERTICAL)
-        pv.Add(label(p, "3D preview", bold=True), 0, wx.BOTTOM, 4)
-        grid = wx.GridSizer(2, 2, 4, 4)
+        pv.Add(label(p, "Preview", bold=True), 0, wx.BOTTOM, 4)
+        grid = wx.GridSizer(3, 2, 4, 4)
         self.views = {}
         blank = self.blank_bitmap()
-        for name in importer.PREVIEW_VIEWS:
+        for name in ["Symbol", "Footprint"] + list(importer.PREVIEW_VIEWS):
             cell = wx.BoxSizer(wx.VERTICAL)
             cell.Add(label(p, name), 0)
             bmp = wx.StaticBitmap(p, bitmap=blank)
@@ -528,6 +529,7 @@ class ImportDialog(wx.Dialog):
             self.mfr.SetValue(d["manufacturer"])
             self.ds.SetValue(d["datasheet"])
         self.validate()
+        self.schedule_preview()
 
     def on_footprint(self):
         _, fp, _ = self.current()
@@ -551,7 +553,7 @@ class ImportDialog(wx.Dialog):
 
     # ---- 3D preview
 
-    PREVIEW_SIZE = (260, 200)
+    PREVIEW_SIZE = (240, 180)
 
     def blank_bitmap(self):
         bmp = wx.Bitmap(*self.PREVIEW_SIZE)
@@ -570,12 +572,16 @@ class ImportDialog(wx.Dialog):
         self.preview_timer = wx.CallLater(400, self.start_preview)
 
     def start_preview(self):
-        _, fp, model = self.current()
-        if not fp or not self.dl:
-            self.preview_status.SetLabel("No footprint selected.")
+        sym, fp, model = self.current()
+        if not self.dl:
             return
         self.preview_gen += 1
         gen = self.preview_gen
+        drawings = (sym, fp, self.dl.tmp / "preview" / f"{gen}-2d")
+        if not fp:
+            self.render_drawings(gen, *drawings)
+            self.preview_status.SetLabel("No footprint selected.")
+            return
         args = (fp, model, [c.GetValue() for c in self.off], [c.GetValue() for c in self.rot],
                 self.dl.tmp / "preview" / str(gen), self.PREVIEW_SIZE)
         self.preview_status.SetLabel("Rendering..." if gen > 1 else
@@ -583,11 +589,45 @@ class ImportDialog(wx.Dialog):
 
         def work():
             try:
+                self.render_drawings(gen, *drawings)
                 importer.render_preview(*args, on_view=lambda n, png: wx.CallAfter(self.show_view, gen, n, png))
                 wx.CallAfter(self.preview_done, gen, None)
             except Exception as e:  # noqa: BLE001 - preview is optional
                 wx.CallAfter(self.preview_done, gen, e)
         threading.Thread(target=work, daemon=True).start()
+
+    def render_drawings(self, gen, sym, fp, outdir):
+        """Symbol and footprint drawings (quick), shown before the 3D views."""
+        for name, fn, item in (("Symbol", importer.render_symbol_svg, sym),
+                               ("Footprint", importer.render_footprint_svg, fp)):
+            svg = None
+            if item:
+                try:
+                    svg = fn(item, outdir)
+                except Exception:  # noqa: BLE001 - preview is optional
+                    svg = None
+            wx.CallAfter(self.show_svg, gen, name, svg)
+
+    def show_svg(self, gen, name, svg):
+        if gen != self.preview_gen or not self:
+            return
+        w, h = self.PREVIEW_SIZE
+        bmp = wx.Bitmap(w, h)
+        dc = wx.MemoryDC(bmp)
+        dc.SetBackground(wx.Brush(wx.WHITE if svg else wx.Colour(225, 225, 228)))
+        dc.Clear()
+        if svg:
+            try:
+                img = wx.svg.SVGimage.CreateFromBytes(Path(svg).read_bytes())
+                scale = min(w / img.width, h / img.height)
+                gc = wx.GraphicsContext.Create(dc)
+                gc.Translate((w - img.width * scale) / 2, (h - img.height * scale) / 2)
+                img.RenderToGC(gc, scale)
+                del gc
+            except Exception:  # noqa: BLE001
+                pass
+        dc.SelectObject(wx.NullBitmap)
+        self.views[name].SetBitmap(bmp)
 
     def show_view(self, gen, name, png):
         if gen != self.preview_gen or not self:

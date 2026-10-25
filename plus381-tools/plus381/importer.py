@@ -659,3 +659,47 @@ def search_urls(query):
     q = quote_plus(query.strip())
     return {"lcsc": f"https://www.lcsc.com/search?q={q}",
             "digikey": f"https://www.digikey.com/en/products/result?keywords={q}"}
+
+
+def _pad_svg(svg, frac=0.08):
+    """Widen an SVG's viewBox a little so the drawing doesn't touch the edges."""
+    text = Path(svg).read_text(encoding="utf-8")
+    m = re.search(r'viewBox="([-\d.e]+)[ ,]+([-\d.e]+)[ ,]+([-\d.e]+)[ ,]+([-\d.e]+)"', text)
+    if m:
+        x, y, w, h = (float(v) for v in m.groups())
+        d = frac * max(w, h)
+        text = text.replace(m.group(0), f'viewBox="{x - d} {y - d} {w + 2 * d} {h + 2 * d}"', 1)
+        Path(svg).write_text(text, encoding="utf-8")
+    return Path(svg)
+
+
+def render_symbol_svg(sym, outdir):
+    """The symbol as an SVG drawing (kicad-cli), or None."""
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    lib = outdir / "symbol.kicad_sym"
+    header = sym.header or '(kicad_symbol_lib\n\t(version 20251024)\n\t(generator "plus381_tools")\n'
+    lib.write_text(header.rstrip() + "\n\t" + sym.block.strip() + "\n)\n", encoding="utf-8")
+    svgdir = outdir / "symbol-svg"
+    svgdir.mkdir(exist_ok=True)
+    if not kicad_cli("sym", "export", "svg", lib, "--symbol", sym.name, "-o", svgdir):
+        return None
+    svgs = sorted(svgdir.glob("*.svg"))
+    return _pad_svg(svgs[0]) if svgs else None
+
+
+def render_footprint_svg(fp, outdir):
+    """Pads, silkscreen and courtyard as an SVG drawing (kicad-cli), or None."""
+    outdir = Path(outdir)
+    lib = outdir / "fp.pretty"
+    lib.mkdir(parents=True, exist_ok=True)
+    text = re.sub(r'(\(property\s+"(?:Reference|Value)"\s+"(?:[^"\\]|\\.)*")', r'\1 (hide yes)', fp.text)
+    text = re.sub(r'^\((?:footprint|module)\s+"?(?:[^"\\\s]|\\.)*"?', '(footprint "preview"', text.lstrip(), count=1)
+    (lib / "preview.kicad_mod").write_text(text, encoding="utf-8")
+    svgdir = outdir / "fp-svg"
+    svgdir.mkdir(exist_ok=True)
+    if not kicad_cli("fp", "export", "svg", lib, "--footprint", "preview",
+                     "--layers", "F.Cu,B.Cu,F.SilkS,F.CrtYd,Edge.Cuts", "-o", svgdir):
+        return None
+    svgs = sorted(svgdir.glob("*.svg"))
+    return _pad_svg(svgs[0]) if svgs else None
