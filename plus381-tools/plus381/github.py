@@ -17,13 +17,23 @@ import urllib.parse
 import urllib.request
 
 from . import partsync
-from .partsync import _hidden, app_dir
+from .partsync import _hidden
 
 # OAuth App "Plus381 Tools" owned by the plus381-robotics organisation, with
 # Device Flow enabled. The client ID is public by design (no secret is used).
 CLIENT_ID = "Ov23liVILoeUcEa0Nh1w"
 SCOPE = "public_repo"
-OWNER, REPO = "plus381-robotics", "kicad-parts"
+
+
+
+def repo_slug(cfg=None):
+    """(owner, name) of the library repository on GitHub."""
+    from urllib.parse import urlparse
+    path = urlparse(partsync.repo_url(cfg or partsync.load_config())).path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    owner, _, name = path.partition("/")
+    return owner, name
 
 # Overridable for tests against a fake server.
 WEB = os.environ.get("PLUS381_GITHUB_WEB", "https://github.com").rstrip("/")
@@ -158,43 +168,33 @@ def _git_cred(cfg, action, fields):
     return out
 
 
-def _ensure_helper(cfg):
-    """Use the computer's credential manager when Git has one; otherwise a
-    private file in the plugin's settings folder (Linux without a keyring)."""
-    exe = cfg.get("git") or partsync.find_git()
-    helper = subprocess.run([exe, "-C", cfg["parts_dir"], "config", "--get-all", "credential.helper"],
-                            capture_output=True, text=True, **_hidden()).stdout.strip()
-    if helper:
-        return
-    store = app_dir() / "git-credentials"
-    store.touch(exist_ok=True)
-    try:
-        os.chmod(store, 0o600)
-    except OSError:
-        pass
-    partsync.git(cfg, "config", "--local", "credential.helper", f'store --file="{store.as_posix()}"')
-
-
 def save_token(cfg, login, token):
-    _ensure_helper(cfg)
-    _git_cred(cfg, "approve", {"protocol": "https", "host": HOST, "username": login, "password": token})
+    partsync.save_token(token)
     cfg = partsync.load_config()
     cfg["github_login"] = login
     partsync.save_config(cfg)
 
 
 def get_token(cfg):
+    token = partsync.load_token()
+    if token:
+        return token
+    # Logins from plugin versions before 0.6 live in Git's credential store:
+    # move them to the plugin's own store.
     login = partsync.load_config().get("github_login")
     if not login:
         return None
-    out = _git_cred(cfg, "fill", {"protocol": "https", "host": HOST, "username": login})
-    return out.get("password") or None
+    token = _git_cred(cfg, "fill", {"protocol": "https", "host": HOST, "username": login}).get("password")
+    if token:
+        partsync.save_token(token)
+    return token or None
 
 
 def logout(cfg):
     login = partsync.load_config().get("github_login")
     token = get_token(cfg)
-    if login and token:
+    partsync.delete_token()
+    if login and token:  # also remove a login left by older versions
         _git_cred(cfg, "reject", {"protocol": "https", "host": HOST, "username": login, "password": token})
     cfg = partsync.load_config()
     for k in ("github_login", "publish_mode"):
@@ -213,7 +213,8 @@ def whoami(token):
 
 
 def can_push(token):
-    repo = api("GET", f"/repos/{OWNER}/{REPO}", token)
+    owner, name = repo_slug()
+    repo = api("GET", f"/repos/{owner}/{name}", token)
     return bool(repo.get("permissions", {}).get("push"))
 
 
@@ -237,13 +238,14 @@ def after_login(cfg, token):
 # --------------------------------------------------------------------------
 
 def ensure_fork(token, login):
-    """The user's fork of kicad-parts (created on first use)."""
-    status, body = _request("GET", f"{API}/repos/{login}/{REPO}", token=token)
+    """The user's fork of the library repository (created on first use)."""
+    owner, name = repo_slug()
+    status, body = _request("GET", f"{API}/repos/{login}/{name}", token=token)
     if status == 200 and body.get("fork"):
         return body
-    api("POST", f"/repos/{OWNER}/{REPO}/forks", token, {"default_branch_only": True})
+    api("POST", f"/repos/{owner}/{name}/forks", token, {"default_branch_only": True})
     for _ in range(60):  # GitHub creates forks asynchronously
-        status, body = _request("GET", f"{API}/repos/{login}/{REPO}", token=token)
+        status, body = _request("GET", f"{API}/repos/{login}/{name}", token=token)
         if status == 200:
             return body
         time.sleep(2)
@@ -256,14 +258,15 @@ def open_pull_request(cfg, token, title, body_text):
     login = partsync.load_config()["github_login"]
     fork = ensure_fork(token, login)
     branch = f"parts/{login}"
-    url = fork.get("clone_url") or f"{WEB}/{login}/{REPO}.git"
+    owner, name = repo_slug()
+    url = fork.get("clone_url") or f"{WEB}/{login}/{name}.git"
     # The branch only ever holds this user's pending parts on top of main.
     partsync.git(cfg, "push", "--quiet", "--force", url, f"HEAD:refs/heads/{branch}")
-    status, existing = _request("GET", f"{API}/repos/{OWNER}/{REPO}/pulls?state=open&head={login}:{branch}",
+    status, existing = _request("GET", f"{API}/repos/{owner}/{name}/pulls?state=open&head={login}:{branch}",
                                 token=token)
     if status == 200 and isinstance(existing, list) and existing:
         return existing[0]["html_url"], False
-    pr = api("POST", f"/repos/{OWNER}/{REPO}/pulls", token,
+    pr = api("POST", f"/repos/{owner}/{name}/pulls", token,
              {"title": title, "head": f"{login}:{branch}", "base": partsync.BRANCH, "body": body_text,
               "maintainer_can_modify": True})
     return pr["html_url"], True

@@ -81,8 +81,17 @@ def quick_sync(parent, cfg):
 # Setup
 # --------------------------------------------------------------------------
 
-def do_setup(log, parts_dir, name, email, auto):
+def _same_repo(a, b):
+    def norm(u):
+        u = u.strip().lower().rstrip("/")
+        u = u[:-4] if u.endswith(".git") else u
+        return u.replace("git@github.com:", "https://github.com/")
+    return norm(a) == norm(b)
+
+
+def do_setup(log, parts_dir, name, email, auto, repo=None):
     parts_dir = Path(parts_dir).expanduser()
+    repo = (repo or "").strip() or partsync.REPO_URL
     gitexe = partsync.find_git()
     if not gitexe:
         raise GitError("Git was not found.\n\nWindows: install Git for Windows (git-scm.com) or GitHub Desktop.\n"
@@ -101,24 +110,31 @@ def do_setup(log, parts_dir, name, email, auto):
     if (parts_dir / ".git").exists():
         url = subprocess.run([gitexe, "-C", str(parts_dir), "remote", "get-url", "origin"],
                              capture_output=True, text=True, **hidden).stdout.strip()
-        if "kicad-parts" not in url:
-            raise GitError(f"{parts_dir} is a different Git repository ({url}). Choose another folder.")
+        if not _same_repo(url, repo):
+            raise GitError(f"{parts_dir} holds a different library ({url}).\n\nTo switch to {repo}, choose a "
+                           "new, empty library folder.")
         log(f"Using existing library at {parts_dir}")
     else:
         if parts_dir.exists() and any(parts_dir.iterdir()):
             raise GitError(f"{parts_dir} is not empty. Choose an empty or new folder.")
         parts_dir.parent.mkdir(parents=True, exist_ok=True)
-        log(f"Downloading the parts library to {parts_dir} ...")
-        r = subprocess.run([gitexe, "clone", partsync.REPO_URL, str(parts_dir)], capture_output=True,
+        log(f"Downloading {repo} to {parts_dir} ...")
+        r = subprocess.run([gitexe, "clone", repo, str(parts_dir)], capture_output=True,
                            text=True, env=env, **hidden)
         if r.returncode != 0 or not (parts_dir / "categories.json").exists():
             shutil.rmtree(parts_dir, ignore_errors=True)  # don't leave a half download behind
+            if r.returncode == 0:
+                raise GitError(f"{repo} is not a parts library: it has no categories.json. Start your own "
+                               "library from a copy of github.com/plus381-robotics/kicad-parts.")
             raise GitError("Could not download the parts library:\n" + (r.stderr or r.stdout).strip() +
-                           "\n\nCheck your internet connection and try again.")
+                           "\n\nCheck the repository address and your internet connection.")
         log("Download: ok")
 
     cfg = partsync.load_config()
-    cfg.update(parts_dir=str(parts_dir), git=gitexe)
+    if not _same_repo(cfg.get("repo_url") or partsync.REPO_URL, repo):
+        # Another library: the GitHub login and publish mode were for the old one.
+        cfg.pop("publish_mode", None)
+    cfg.update(parts_dir=str(parts_dir), git=gitexe, repo_url=repo)
     partsync.save_config(cfg)
     if name and email:
         publish.set_identity(cfg, name, email)
@@ -128,7 +144,7 @@ def do_setup(log, parts_dir, name, email, auto):
     for p in problems:
         log("! " + p)
     if not problems:
-        log(f"Registered {len(partsync.libraries(cfg['parts_dir']))} Plus381 libraries in KiCad")
+        log(f"Registered {len(partsync.libraries(cfg['parts_dir']))} libraries in KiCad")
 
     state = partsync.ensure_env_var(cfg["parts_dir"])
     if state == "pending":
@@ -158,13 +174,18 @@ class SetupDialog(wx.Dialog):
         cfg = partsync.load_config()
         p = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
-        s.Add(label(p, "Connect this computer to the Plus381 parts library", bold=True), 0, wx.ALL, PAD)
-        s.Add(label(p, "This downloads the team library, adds all Plus381 libraries to KiCad and keeps "
-                       "them up to date in the background. You only do this once per computer.", wrap=520),
+        s.Add(label(p, "Connect this computer to the parts library", bold=True), 0, wx.ALL, PAD)
+        s.Add(label(p, "This downloads the parts library, adds its libraries to KiCad and keeps them up to "
+                       "date in the background. You only do this once per computer.", wrap=520),
               0, wx.LEFT | wx.RIGHT, PAD)
 
         g = wx.FlexGridSizer(2, PAD, PAD)
         g.AddGrowableCol(1)
+        g.Add(label(p, "Library repository:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.repo = wx.TextCtrl(p, value=partsync.repo_url(cfg))
+        self.repo.SetToolTip("The GitHub repository holding the parts. Leave the default for the Plus381 team "
+                             "library; other teams can use their own copy of kicad-parts.")
+        g.Add(self.repo, 1, wx.EXPAND)
         g.Add(label(p, "Library folder:"), 0, wx.ALIGN_CENTER_VERTICAL)
         # A plain text field: wx.DirPickerCtrl clears paths that don't exist yet.
         row = wx.BoxSizer(wx.HORIZONTAL)
@@ -223,7 +244,7 @@ class SetupDialog(wx.Dialog):
         try:
             _, problems = run_busy(self, "Setting up (the first download can take a few minutes)...", do_setup,
                                    self.append, self.folder.GetValue().strip(), self.name.GetValue().strip(),
-                                   self.email.GetValue().strip(), self.auto.GetValue())
+                                   self.email.GetValue().strip(), self.auto.GetValue(), self.repo.GetValue())
         except Exception as e:  # noqa: BLE001
             self.append("ERROR: " + str(e))
             error(self, e, "Setup failed")
@@ -680,7 +701,7 @@ class ImportDialog(wx.Dialog):
         except Exception as e:  # noqa: BLE001
             error(self, f"Import failed:\n{e}")
             return
-        nick = importer.LIB_PREFIX + c.category
+        nick = partsync.lib_prefix(self.cfg["parts_dir"]) + c.category
         partsync.ensure_lib_tables(self.cfg["parts_dir"])
         lines = [f"- {what}: {Path(path).name}" for what, path in written]
         if nick not in self.known_libs:
@@ -982,6 +1003,7 @@ class StatusDialog(wx.Dialog):
             pending = "?"
         auto = autosync.installed()
         lines = [
+            f"Repository:       {partsync.repo_url(cfg)}",
             f"Library folder:   {cfg['parts_dir']}",
             f"Contents:         {len(libs)} libraries, {n_sym} symbols, {n_fp} footprints, {n_3d} 3D models",
             f"Last sync:        {st.get('time', 'never')}  {'OK' if st.get('ok') else 'PROBLEM'}",

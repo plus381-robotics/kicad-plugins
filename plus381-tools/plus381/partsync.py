@@ -28,7 +28,8 @@ LIB_PREFIX = "Plus381_"
 # PLUS381_PARTS_REPO lets a fork or a test setup use another library repository.
 REPO_URL = os.environ.get("PLUS381_PARTS_REPO", "https://github.com/plus381-robotics/kicad-parts.git")
 BRANCH = "main"
-MANAGED_DESCR = "Plus381 team library (managed by Plus381 Tools)"
+MANAGED_DESCR = "Team parts library (managed by Plus381 Tools)"
+MANAGED_MARK = "managed by Plus381 Tools"
 
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -164,12 +165,90 @@ class GitError(Exception):
     pass
 
 
+# --------------------------------------------------------------------------
+# GitHub login token
+# --------------------------------------------------------------------------
+# The plugin keeps its own copy of the GitHub login instead of relying on
+# Git's shared credential store, where other tools (GitHub Desktop, VS Code,
+# Git Credential Manager after a failed request) can replace or erase it.
+# Windows: encrypted for the current Windows user (DPAPI).
+# macOS/Linux: a file only the user can read (like ~/.git-credentials).
+
+def _token_path():
+    return app_dir() / ("github-token.dpapi" if IS_WIN else "github-token")
+
+
+def _dpapi(data, protect):
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, dst = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(dst)):
+        raise OSError("Windows could not " + ("encrypt" if protect else "decrypt") + " the GitHub login")
+    try:
+        return ctypes.string_at(dst.pbData, dst.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(dst.pbData)
+
+
+def save_token(token):
+    path = _token_path()
+    data = token.encode()
+    if IS_WIN:
+        data = _dpapi(data, True)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def load_token():
+    try:
+        data = _token_path().read_bytes()
+        if IS_WIN:
+            data = _dpapi(data, False)
+        return data.decode().strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def delete_token():
+    try:
+        _token_path().unlink()
+    except OSError:
+        pass
+
+
+def _auth_env(cfg):
+    """Git settings (passed in the environment, never on the command line or
+    in a config file) that send the saved login to GitHub for this command."""
+    token = load_token()
+    if not token:
+        return {}
+    import base64
+    from urllib.parse import urlparse
+    url = urlparse(repo_url(cfg))
+    scheme, host = (url.scheme, url.netloc) if url.netloc else ("https", "github.com")
+    login = cfg.get("github_login") or "x-access-token"
+    basic = base64.b64encode(f"{login}:{token}".encode()).decode()
+    n = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+    return {"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": f"http.{scheme}://{host}/.extraheader",
+            f"GIT_CONFIG_VALUE_{n}": f"AUTHORIZATION: basic {basic}"}
+
+
 def git(cfg, *args, check=True, timeout=600):
     exe = cfg.get("git") or find_git()
     if not exe:
         raise GitError("Git is not installed. Install Git for Windows / GitHub Desktop "
                        "(Windows) or git + git-lfs (macOS/Linux).")
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="auto")
+    env.update(_auth_env(cfg))
     r = subprocess.run([exe, "-C", cfg["parts_dir"], *args], capture_output=True, text=True,
                        env=env, timeout=timeout, **_hidden())
     if check and r.returncode != 0:
@@ -196,13 +275,28 @@ def kicad_running():
 # KiCad settings
 # --------------------------------------------------------------------------
 
+def repo_url(cfg):
+    """The library repository this computer uses (Setup can point it at
+    another team's copy of kicad-parts)."""
+    return cfg.get("repo_url") or REPO_URL
+
+
+def lib_prefix(parts_dir):
+    """Library name prefix, set by the library repository's categories.json."""
+    try:
+        return json.loads((Path(parts_dir) / "categories.json").read_text(encoding="utf-8"))["prefix"]
+    except (OSError, ValueError, KeyError):
+        return LIB_PREFIX
+
+
 def libraries(parts_dir):
     """{nickname: {"sym": path, "fp": path}} for every library in the parts repo."""
     parts = Path(parts_dir)
+    prefix = lib_prefix(parts_dir)
     libs = {}
-    for d in sorted((parts / "symbols").glob(LIB_PREFIX + "*.kicad_symdir")):
+    for d in sorted((parts / "symbols").glob(prefix + "*.kicad_symdir")):
         libs.setdefault(d.stem, {})["sym"] = d
-    for d in sorted((parts / "footprints").glob(LIB_PREFIX + "*.pretty")):
+    for d in sorted((parts / "footprints").glob(prefix + "*.pretty")):
         libs.setdefault(d.stem, {})["fp"] = d
     return libs
 
@@ -253,8 +347,11 @@ def ensure_lib_tables(parts_dir):
             entries = _lib_entries(text)
             # Drop our old entries (from the end so offsets stay valid).
             new = text
+            # Drop the entries this plugin added before (marked in their
+            # description; "Plus381_" names from older versions), so a
+            # switch to another library repository leaves nothing behind.
             for s, e, name in reversed(entries):
-                if name.startswith(LIB_PREFIX):
+                if MANAGED_MARK in text[s:e] or name.startswith(LIB_PREFIX):
                     line_start = new.rfind("\n", 0, s) + 1
                     line_end = new.find("\n", e)
                     line_end = len(new) if line_end < 0 else line_end + 1

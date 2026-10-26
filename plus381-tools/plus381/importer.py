@@ -13,7 +13,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .partsync import LIB_PREFIX, VAR, _hidden, app_dir
+from .partsync import VAR, _hidden, app_dir, lib_prefix
 
 MODEL_EXTS = (".step", ".stp", ".stpz", ".step.gz", ".stp.gz", ".wrl")
 
@@ -343,11 +343,11 @@ def categories(parts_dir):
 
 
 def sym_file(parts_dir, category, name):
-    return Path(parts_dir) / "symbols" / f"{LIB_PREFIX}{category}.kicad_symdir" / f"{name}.kicad_sym"
+    return Path(parts_dir) / "symbols" / f"{lib_prefix(parts_dir)}{category}.kicad_symdir" / f"{name}.kicad_sym"
 
 
 def fp_file(parts_dir, category, name):
-    return Path(parts_dir) / "footprints" / f"{LIB_PREFIX}{category}.pretty" / f"{name}.kicad_mod"
+    return Path(parts_dir) / "footprints" / f"{lib_prefix(parts_dir)}{category}.pretty" / f"{name}.kicad_mod"
 
 
 def find_existing(parts_dir, kind, name):
@@ -461,7 +461,7 @@ def check_choices(parts_dir, c):
 def do_import(parts_dir, c):
     """Write the part. Returns a list of (what, path) that were written."""
     written = []
-    nick = LIB_PREFIX + c.category
+    nick = lib_prefix(parts_dir) + c.category
     fp_ref = ""
     if c.footprint:
         model_name = install_model(parts_dir, c.model, c.footprint_name) if c.model else None
@@ -552,13 +552,111 @@ def _bbox(text):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def preview_board(fp_text, path):
-    """A tiny board holding only this footprint, to render it in 3D."""
+_EXTENT_CACHE = {}
+
+
+def model_box(path):
+    """Bounding box ((xmin, ymin, zmin), (xmax, ymax, zmax)) of a 3D model in
+    mm, read from the STEP/VRML points. None if the file can't be read."""
+    path = Path(path)
+    try:
+        key = (str(path), path.stat().st_mtime)
+    except OSError:
+        return None
+    if key in _EXTENT_CACHE:
+        return _EXTENT_CACHE[key]
+    try:
+        raw = path.read_bytes()
+        if raw[:2] == b"\x1f\x8b":  # .step.gz / .stpz / .wrl.gz
+            import gzip
+            raw = gzip.decompress(raw)
+        text = raw.decode("latin-1")
+    except (OSError, EOFError):
+        return None
+    num = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    if "#VRML" in text[:20]:
+        scale = 2.54  # KiCad VRML models: 1 unit = 0.1 inch
+        pts = re.findall(num + r"\s+" + num + r"\s+" + num,
+                         " ".join(re.findall(r"point\s*\[([^\]]*)\]", text)))
+    else:
+        if re.search(r"CONVERSION_BASED_UNIT\s*\(\s*'INCH'", text, re.I):
+            scale = 25.4
+        elif re.search(r"SI_UNIT\s*\(\s*\.MILLI\.\s*,\s*\.METRE\.", text, re.I):
+            scale = 1.0
+        elif re.search(r"SI_UNIT\s*\(\s*\$\s*,\s*\.METRE\.", text, re.I):
+            scale = 1000.0
+        else:
+            scale = 1.0
+        points = dict((m.group(1), m.groups()[1:]) for m in re.finditer(
+            r"#(\d+)\s*=\s*CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(\s*" + num + r"\s*,\s*" + num + r"\s*,\s*" + num,
+            text))
+        # Only the shape's corners (vertices): files also hold construction
+        # points (axis placements, spline controls) far away from the part.
+        pts = [points[v] for v in re.findall(r"VERTEX_POINT\s*\(\s*'[^']*'\s*,\s*#(\d+)", text) if v in points]
+        pts = pts or list(points.values())
+    if not pts:
+        _EXTENT_CACHE[key] = None
+        return None
+    xs, ys, zs = ([float(p[i]) * scale for p in pts] for i in range(3))
+    box = ((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+    _EXTENT_CACHE[key] = box
+    return box
+
+
+def placed_box(box, offset, rotation):
+    """Where the model ends up on the board: KiCad rotates the model about X,
+    then Y, then Z (angles negated), then moves it by the offset.
+    Returns board coordinates (x, y down like the footprint) and height:
+    (x0, y0, x1, y1, z0, z1) in mm."""
+    import math
+    (a0, b0, c0), (a1, b1, c1) = box
+    corners = [(x, y, z) for x in (a0, a1) for y in (b0, b1) for z in (c0, c1)]
+    rx, ry, rz = (math.radians(-v) for v in rotation)
+    out = []
+    for x, y, z in corners:
+        y, z = y * math.cos(rx) - z * math.sin(rx), y * math.sin(rx) + z * math.cos(rx)
+        x, z = x * math.cos(ry) + z * math.sin(ry), -x * math.sin(ry) + z * math.cos(ry)
+        x, y = x * math.cos(rz) - y * math.sin(rz), x * math.sin(rz) + y * math.cos(rz)
+        out.append((x + offset[0], -(y + offset[1]), z + offset[2]))  # 3D y is up, board y is down
+    xs, ys, zs = zip(*out)
+    return min(xs), min(ys), max(xs), max(ys), min(zs), max(zs)
+
+
+def model_reach(fp, model, offset, rotation):
+    """Where the 3D model sits: (x0, y0, x1, y1, z0, z1) in board mm.
+
+    Uses the model's box turned like KiCad turns it. Some STEP files store
+    the shape turned and fix it up with transforms this simple reader can't
+    follow; then the turned box doesn't match the footprint and a cautious
+    box is used instead (a cube as big as the model's longest side), so the
+    part always fits, maybe a little smaller in the picture."""
+    box = model_box(model)
+    if not box:
+        return None
+    placed = placed_box(box, offset, rotation)
+    fx0, fy0, fx1, fy1 = _bbox(fp.text)
+    fw, fh = fx1 - fx0 + 2, fy1 - fy0 + 2
+    pw, ph = placed[2] - placed[0], placed[3] - placed[1]
+    if 0.4 * fw <= pw <= 2.5 * fw and 0.4 * fh <= ph <= 2.5 * fh:
+        return placed
+    d = max(b - a for a, b in zip(*box))
+    return (offset[0] - d / 2, -offset[1] - d / 2, offset[0] + d / 2, -offset[1] + d / 2, -d / 4, d)
+
+
+def preview_board(fp_text, path, model=None, min_size=0.0):
+    """A tiny board holding only this footprint, to render it in 3D.
+    kicad-cli zooms to fit the board, so the board is made to cover the
+    footprint, the placed 3D model (x0, y0, x1, y1) and at least min_size
+    mm, which keeps tall models in view."""
     text = fp_text.strip()
     # Hide reference/value texts: they only clutter the preview.
     text = re.sub(r'(\(property\s+"(?:Reference|Value)"\s+"(?:[^"\\]|\\.)*")', r'\1 (hide yes)', text)
     body = text[text.index("\n") + 1:text.rfind(")")]
     x0, y0, x1, y1 = _bbox(text)
+    if model:
+        x0, y0, x1, y1 = min(x0, model[0]), min(y0, model[1]), max(x1, model[2]), max(y1, model[3])
+    grow = max(0.0, min_size - (x1 - x0)) / 2, max(0.0, min_size - (y1 - y0)) / 2
+    x0, x1, y0, y1 = x0 - grow[0], x1 + grow[0], y0 - grow[1], y1 + grow[1]
     margin = max(1.0, 0.15 * max(x1 - x0, y1 - y0))
     cx, cy = 100, 100
     path.write_text(
@@ -608,15 +706,22 @@ def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=N
     outdir.mkdir(parents=True, exist_ok=True)
     text = build_footprint(fp, "preview", None, offset, rotation,
                            model_path=Path(model).resolve().as_posix() if model else None)
-    board = outdir / "preview.kicad_pcb"
-    preview_board(text, board)
+    # Two boards: one sized for the views from above, one also tall enough
+    # for the side views (kicad-cli fits the board's width into the picture).
+    placed = model_reach(fp, model, offset, rotation) if model else None
+    height = max(placed[5], -placed[4]) if placed else 0.0
+    boards = {}  # kicad-cli fits the board, so each kind of view gets a board big enough for it
+    for kind, factor in (("top", 0.0), ("3d", 1.5), ("side", 2.0)):
+        boards[kind] = outdir / f"preview-{kind}.kicad_pcb"
+        preview_board(text, boards[kind], placed[:4] if placed else None, min_size=factor * height)
     results = {}
     env = _preview_env()
     for name in views or PREVIEW_VIEWS:
         png = outdir / f"{name}.png"
         if png.exists():
             png.unlink()
-        r = subprocess.run([cli, "pcb", "render", str(board), "-o", str(png), "-w", str(size[0]),
+        source = boards["side" if name in ("Front", "Right") else "3d" if name == "3D" else "top"]
+        r = subprocess.run([cli, "pcb", "render", str(source), "-o", str(png), "-w", str(size[0]),
                             "-h", str(size[1]), "--background", "opaque", "--zoom", "0.9",
                             *PREVIEW_VIEWS[name]], capture_output=True, text=True, env=env, **_hidden())
         if r.returncode == 0 and png.exists():
