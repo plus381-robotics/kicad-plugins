@@ -746,13 +746,17 @@ def fetch_lcsc(lcsc_id, outdir):
         raise ValueError(f"'{lcsc_id}' is not an LCSC part number (they look like C8734).")
     out = Path(outdir) / lcsc_id
     out.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run([sys.executable, "-m", "easyeda2kicad", "--full", "--lcsc_id", lcsc_id,
+    from .partsync import plugin_python
+    r = subprocess.run([plugin_python(), "-m", "easyeda2kicad", "--full", "--lcsc_id", lcsc_id,
                         "--output", str(out / "lcsc.kicad_sym")], cwd=str(out), capture_output=True,
                        text=True, timeout=180, **_hidden())
     text = (r.stdout + r.stderr)
     if "No module named easyeda2kicad" in text:
-        raise RuntimeError("The LCSC converter (easyeda2kicad) isn't installed. Update Plus381 Tools in the "
-                           "Plugin and Content Manager and restart KiCad (it needs internet the first time).")
+        raise RuntimeError("The LCSC converter (easyeda2kicad) isn't installed yet. KiCad installs it for the "
+                           "normal Plus381 buttons: use the normal Import part button once (if its button is "
+                           "missing, enable Preferences > Plugins > Enable KiCad API and restart KiCad; it "
+                           "needs internet the first time). After that, the fallback button can import LCSC "
+                           "parts too.")
     if not any(out.rglob("*.kicad_mod")) and not any(out.rglob("*.kicad_sym")):
         errors = [l for l in text.splitlines() if "ERROR" in l] or text.strip().splitlines()[-3:]
         raise RuntimeError(f"LCSC/EasyEDA has no KiCad data for {lcsc_id}:\n" + "\n".join(errors))

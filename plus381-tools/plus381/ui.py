@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import traceback
@@ -19,6 +20,24 @@ from .partsync import Conflict, GitError
 
 TITLE = "Plus381 Tools"
 PAD = 8
+ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
+CURRENT_ICON = "status"  # icon for windows opened without a parent
+
+
+def set_icon(win, kind=None):
+    """Give a window its own taskbar/title-bar icon (otherwise Linux shows a
+    generic Python icon and all Plus381 windows look alike)."""
+    kind = kind or CURRENT_ICON
+    try:
+        bundle = wx.IconBundle()
+        for size in (16, 24, 32, 48, 64, 128):
+            f = ICON_DIR / f"window-{kind}-{size}.png"
+            if f.exists():
+                bundle.AddIcon(wx.Icon(str(f), wx.BITMAP_TYPE_PNG))
+        win.SetIcons(bundle)
+        win._icon_kind = kind
+    except Exception:  # noqa: BLE001 - an icon is never worth failing for
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -39,6 +58,7 @@ def run_busy(parent, message, fn, *args, **kwargs):
     t = threading.Thread(target=work, daemon=True)
     t.start()
     dlg = wx.ProgressDialog(TITLE, message, parent=parent, style=wx.PD_APP_MODAL | wx.PD_SMOOTH)
+    set_icon(dlg, getattr(parent, "_icon_kind", None))
     while t.is_alive():
         dlg.Pulse()
         wx.MilliSleep(80)
@@ -49,12 +69,20 @@ def run_busy(parent, message, fn, *args, **kwargs):
     return result.get("value")
 
 
+def _message(parent, text, title, style):
+    dlg = wx.MessageDialog(parent, str(text), f"{TITLE}: {title}", style)
+    set_icon(dlg, getattr(parent, "_icon_kind", None))
+    answer = dlg.ShowModal()
+    dlg.Destroy()
+    return answer
+
+
 def error(parent, text, title="Something went wrong"):
-    wx.MessageBox(str(text), f"{TITLE}: {title}", wx.OK | wx.ICON_ERROR, parent)
+    _message(parent, text, title, wx.OK | wx.ICON_ERROR)
 
 
 def info(parent, text, title="Done"):
-    wx.MessageBox(str(text), f"{TITLE}: {title}", wx.OK | wx.ICON_INFORMATION, parent)
+    _message(parent, text, title, wx.OK | wx.ICON_INFORMATION)
 
 
 def label(parent, text, bold=False, wrap=0, colour=None):
@@ -171,6 +199,7 @@ def do_setup(log, parts_dir, name, email, auto, repo=None):
 class SetupDialog(wx.Dialog):
     def __init__(self, parent=None):
         super().__init__(parent, title=f"{TITLE}: Setup", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        set_icon(self, "setup")
         cfg = partsync.load_config()
         p = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
@@ -275,6 +304,28 @@ def ensure_setup(parent=None):
 # Import
 # --------------------------------------------------------------------------
 
+def svg_on_white(data, w, h):
+    """An SVG drawing centred on a white w x h picture, without transparency.
+    (Drawing onto a white bitmap with a GraphicsContext gives a black
+    background when the plugin runs inside the PCB editor.)"""
+    img = wx.svg.SVGimage.CreateFromBytes(data)
+    scale = min(w / img.width, h / img.height)
+    sw, sh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+    drawn = img.ConvertToScaledBitmap(wx.Size(sw, sh)).ConvertToImage()
+    rgb, alpha = bytes(drawn.GetData()), drawn.GetAlpha() if drawn.HasAlpha() else None
+    out = bytearray(b"\xff" * (w * h * 3))
+    x0, y0 = (w - sw) // 2, (h - sh) // 2
+    for y in range(sh):
+        for x in range(sw):
+            k = y * sw + x
+            a = alpha[k] if alpha is not None else 255
+            if a:
+                o = ((y0 + y) * w + x0 + x) * 3
+                for c in range(3):
+                    out[o + c] = (rgb[3 * k + c] * a + 255 * (255 - a)) // 255
+    return wx.Image(w, h, bytes(out)).ConvertToBitmap()
+
+
 class CategoryCombo(wx.adv.OwnerDrawnComboBox):
     """Category drop-down whose list shows each category's description under
     its name, so you can see what belongs where while choosing."""
@@ -310,6 +361,7 @@ class ImportDialog(wx.Dialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent, title=f"{TITLE}: Import part",
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        set_icon(self, "import")
         self.cfg = cfg
         self.dl = None
         self.cats = importer.categories(cfg["parts_dir"])
@@ -375,23 +427,26 @@ class ImportDialog(wx.Dialog):
         row("3D model:", self.model)
         s.Add(g, 0, wx.EXPAND | wx.ALL, PAD)
 
-        t = wx.FlexGridSizer(5, PAD, PAD)
+        # The fields keep their natural width: on Linux (GTK) they carry -/+
+        # buttons that get cut off when the field is made narrower.
+        t = wx.FlexGridSizer(4, PAD, PAD)
         t.Add(label(p, "3D offset (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self.off = [wx.SpinCtrlDouble(p, min=-100, max=100, inc=0.05, size=(90, -1)) for _ in range(3)]
+        self.off = [wx.SpinCtrlDouble(p, min=-100, max=100, inc=0.05) for _ in range(3)]
         for c in self.off:
             c.SetDigits(3)
+            c.SetToolTip("Move the 3D model (mm). -/+ step by 0.05 mm.")
             t.Add(c)
-        t.AddSpacer(0)
         t.Add(label(p, "3D rotation (deg):"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self.rot = [wx.SpinCtrlDouble(p, min=-360, max=360, inc=90, size=(90, -1)) for _ in range(3)]
+        self.rot = [wx.SpinCtrlDouble(p, min=-360, max=360, inc=90) for _ in range(3)]
         for c in self.rot:
             c.SetDigits(1)
+            c.SetToolTip("Turn the 3D model around X / Y / Z. -/+ turn by 90 degrees.")
             t.Add(c)
+        s.Add(t, 0, wx.LEFT | wx.RIGHT | wx.TOP, PAD)
         self.reset = wx.Button(p, label="Vendor values")
         self.reset.SetToolTip("Undo your changes: back to the offset/rotation from the download")
         self.reset.Bind(wx.EVT_BUTTON, lambda e: self.vendor_values())
-        t.Add(self.reset, 0, wx.ALIGN_CENTER_VERTICAL)
-        s.Add(t, 0, wx.ALL, PAD)
+        s.Add(self.reset, 0, wx.ALL, PAD)
         s.Add(label(p, "Offset/rotation start as the vendor set them. Adjust them until the preview on the "
                        "right looks right (pins on the pads, part flat on the board).", wrap=620),
               0, wx.LEFT | wx.RIGHT, PAD)
@@ -399,6 +454,9 @@ class ImportDialog(wx.Dialog):
         self.replace = wx.CheckBox(p, label="Replace existing part with the same name")
         s.Add(self.replace, 0, wx.ALL, PAD)
         self.problems = label(p, "", colour=wx.Colour(200, 0, 0))
+        # Room for a few lines of warnings, so the window doesn't need to grow
+        # (and cut off its buttons) when one appears.
+        self.problems.SetMinSize((-1, self.problems.GetCharHeight() * 3 + 4))
         s.Add(self.problems, 0, wx.LEFT | wx.RIGHT, PAD)
 
         b = wx.BoxSizer(wx.HORIZONTAL)
@@ -577,7 +635,7 @@ class ImportDialog(wx.Dialog):
     PREVIEW_SIZE = (240, 180)
 
     def blank_bitmap(self):
-        bmp = wx.Bitmap(*self.PREVIEW_SIZE)
+        bmp = wx.Bitmap(*self.PREVIEW_SIZE, 24)  # no alpha: inside KiCad it would show black
         dc = wx.MemoryDC(bmp)
         dc.SetBackground(wx.Brush(wx.Colour(225, 225, 228)))
         dc.Clear()
@@ -633,22 +691,13 @@ class ImportDialog(wx.Dialog):
         if gen != self.preview_gen or not self:
             return
         w, h = self.PREVIEW_SIZE
-        bmp = wx.Bitmap(w, h)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.WHITE if svg else wx.Colour(225, 225, 228)))
-        dc.Clear()
+        bmp = None
         if svg:
             try:
-                img = wx.svg.SVGimage.CreateFromBytes(Path(svg).read_bytes())
-                scale = min(w / img.width, h / img.height)
-                gc = wx.GraphicsContext.Create(dc)
-                gc.Translate((w - img.width * scale) / 2, (h - img.height * scale) / 2)
-                img.RenderToGC(gc, scale)
-                del gc
-            except Exception:  # noqa: BLE001
-                pass
-        dc.SelectObject(wx.NullBitmap)
-        self.views[name].SetBitmap(bmp)
+                bmp = svg_on_white(Path(svg).read_bytes(), w, h)
+            except Exception:  # noqa: BLE001 - preview is optional
+                bmp = None
+        self.views[name].SetBitmap(bmp or self.blank_bitmap())
 
     def show_view(self, gen, name, png):
         if gen != self.preview_gen or not self:
@@ -728,6 +777,7 @@ class ImportDialog(wx.Dialog):
 class PublishDialog(wx.Dialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent, title=f"{TITLE}: Publish", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        set_icon(self, "publish")
         self.cfg = cfg
         p = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
@@ -886,6 +936,7 @@ class LoginDialog(wx.Dialog):
 
     def __init__(self, parent, start):
         super().__init__(parent, title=f"{TITLE}: Log in to GitHub")
+        set_icon(self, "publish")
         self.start = start
         self.token = None
         self.err = None
@@ -970,6 +1021,7 @@ def login_dialog(parent, cfg):
 class StatusDialog(wx.Dialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent, title=f"{TITLE}: Library status", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        set_icon(self, "status")
         self.cfg = cfg
         p = self.panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
@@ -1078,21 +1130,36 @@ class StatusDialog(wx.Dialog):
 _app = None
 
 
-def main(action):
-    global _app
-    _app = wx.App(False)  # must stay alive while the dialogs run
+def main(action, parent=None):
+    """Run one action. Called by the API entry scripts (own process) and by
+    the fallback buttons in the PCB editor (inside KiCad, parent = editor)."""
+    global _app, CURRENT_ICON
+    CURRENT_ICON = {"import": "import", "publish": "publish", "setup": "setup"}.get(action, "status")
+    if not wx.GetApp():
+        _app = wx.App(False)  # must stay alive while the dialogs run
+        # Linux taskbars name and group windows by this (else "import_part.py").
+        _app.SetAppName("plus381-tools")
+        _app.SetClassName("Plus381 Tools")
+        _app.SetAppDisplayName(TITLE)
     try:
-        cfg = ensure_setup()
+        cfg = ensure_setup(parent)
         if not cfg:
             return
         autosync.refresh_script()
+        if sys.prefix != sys.base_prefix:
+            # Remember the plugin's environment for the fallback buttons
+            # (it has easyeda2kicad installed).
+            c = partsync.load_config()
+            if c.get("plugin_python") != sys.executable:
+                c["plugin_python"] = sys.executable
+                partsync.save_config(c)
         if action != "setup":
-            st = quick_sync(None, cfg)
+            st = quick_sync(parent, cfg)
             if not st.get("ok") and st.get("message"):
                 wx.MessageBox("Could not get the newest parts (you can keep working):\n\n" + st["message"],
-                              TITLE, wx.OK | wx.ICON_WARNING)
+                              TITLE, wx.OK | wx.ICON_WARNING, parent)
         dlg = {"import": ImportDialog, "publish": PublishDialog, "status": StatusDialog}.get(action, StatusDialog)
-        d = dlg(cfg)
+        d = dlg(cfg, parent)
         d.ShowModal()
         d.Destroy()
     except Exception:  # noqa: BLE001 - last resort: show instead of dying silently

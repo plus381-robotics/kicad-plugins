@@ -137,9 +137,26 @@ def find_git():
     return None
 
 
+def _is_python(path):
+    return bool(path) and os.path.basename(str(path)).lower().startswith("python") and os.path.isfile(path)
+
+
 def base_python():
     """The real interpreter behind the plugin's virtual environment, which
-    KiCad may delete and recreate at any time."""
+    KiCad may delete and recreate at any time.
+
+    Inside the PCB editor (the fallback buttons), sys.executable is KiCad
+    itself, so look for the Python that ships with KiCad instead."""
+    if not _is_python(sys.executable):
+        here = Path(sys.executable).resolve().parent
+        candidates = [load_config().get("python"),
+                      here / "pythonw.exe", here / "python.exe",
+                      Path(sys.prefix) / "bin" / "python3", Path(sys.base_prefix) / "bin" / "python3",
+                      shutil.which("python3"), shutil.which("python")]
+        for c in candidates:
+            if c and _is_python(str(c)):
+                return str(c)
+        return sys.executable
     exe = getattr(sys, "_base_executable", None) or sys.executable
     if sys.prefix != sys.base_prefix and exe == sys.executable:
         cfg = Path(sys.prefix) / "pyvenv.cfg"
@@ -151,6 +168,15 @@ def base_python():
         except (OSError, AttributeError):
             pass
     return exe
+
+
+def plugin_python():
+    """The Python of the plugin's own environment (the one with the plugin's
+    extra packages, e.g. easyeda2kicad), remembered from API runs."""
+    if sys.prefix != sys.base_prefix and _is_python(sys.executable):
+        return sys.executable
+    venv = load_config().get("plugin_python")
+    return venv if _is_python(venv) else base_python()
 
 
 def _hidden():

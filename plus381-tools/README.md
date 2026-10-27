@@ -32,6 +32,19 @@ log in once from inside KiCad (see *Logging in* below).
 The first click on a button after installing or updating takes a few seconds
 longer while KiCad prepares the plugin.
 
+### If the buttons don't show
+
+KiCad sometimes shows the three Plus381 buttons late, or not at all (they
+also need **Preferences → Plugins → Enable KiCad API**). The plugin
+therefore adds a **fallback** that KiCad loads directly into the PCB editor:
+
+* a **381** toolbar button that asks what to do (Import part / Publish
+  changes / Library status), and
+* **Tools → External Plugins → Plus381: … (fallback)** menu entries.
+
+They open the same windows. Only importing by LCSC number needs the normal
+buttons to have run once first (KiCad installs the LCSC converter for them).
+
 ## Daily use
 
 | Task | How |
