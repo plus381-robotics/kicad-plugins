@@ -35,14 +35,8 @@ def _editor_window():
 
 
 def _run(action):
-    import wx
-    try:
-        from plus381 import ui
-    except Exception:  # noqa: BLE001 - show why instead of failing silently
-        import traceback
-        wx.MessageBox(traceback.format_exc(), "Plus381 Tools: could not start", wx.OK | wx.ICON_ERROR)
-        return
-    ui.main(action, parent=_editor_window())
+    from plus381 import start
+    start.run(action, parent=_editor_window())
 
 
 if pcbnew is not None:

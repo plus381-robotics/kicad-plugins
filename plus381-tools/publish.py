@@ -4,6 +4,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from plus381 import ui  # noqa: E402
+from plus381 import start  # noqa: E402
 
-ui.main("publish")
+start.run("publish")

@@ -13,9 +13,8 @@ from pathlib import Path
 
 import wx
 import wx.adv
-import wx.svg
 
-from . import autosync, github, importer, partsync, publish
+from . import __version__, autosync, github, importer, partsync, publish, svgdraw
 from .partsync import Conflict, GitError
 
 TITLE = "Plus381 Tools"
@@ -303,28 +302,6 @@ def ensure_setup(parent=None):
 # --------------------------------------------------------------------------
 # Import
 # --------------------------------------------------------------------------
-
-def svg_on_white(data, w, h):
-    """An SVG drawing centred on a white w x h picture, without transparency.
-    (Drawing onto a white bitmap with a GraphicsContext gives a black
-    background when the plugin runs inside the PCB editor.)"""
-    img = wx.svg.SVGimage.CreateFromBytes(data)
-    scale = min(w / img.width, h / img.height)
-    sw, sh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
-    drawn = img.ConvertToScaledBitmap(wx.Size(sw, sh)).ConvertToImage()
-    rgb, alpha = bytes(drawn.GetData()), drawn.GetAlpha() if drawn.HasAlpha() else None
-    out = bytearray(b"\xff" * (w * h * 3))
-    x0, y0 = (w - sw) // 2, (h - sh) // 2
-    for y in range(sh):
-        for x in range(sw):
-            k = y * sw + x
-            a = alpha[k] if alpha is not None else 255
-            if a:
-                o = ((y0 + y) * w + x0 + x) * 3
-                for c in range(3):
-                    out[o + c] = (rgb[3 * k + c] * a + 255 * (255 - a)) // 255
-    return wx.Image(w, h, bytes(out)).ConvertToBitmap()
-
 
 class CategoryCombo(wx.adv.OwnerDrawnComboBox):
     """Category drop-down whose list shows each category's description under
@@ -694,8 +671,9 @@ class ImportDialog(wx.Dialog):
         bmp = None
         if svg:
             try:
-                bmp = svg_on_white(Path(svg).read_bytes(), w, h)
+                bmp = svgdraw.render(Path(svg).read_bytes(), w, h)
             except Exception:  # noqa: BLE001 - preview is optional
+                log_error(f"drawing the {name} preview")
                 bmp = None
         self.views[name].SetBitmap(bmp or self.blank_bitmap())
 
@@ -1130,6 +1108,21 @@ class StatusDialog(wx.Dialog):
 _app = None
 
 
+def log_error(what):
+    """Append the current exception to plugin.log (to send when asking for help)."""
+    import datetime
+    log = partsync.app_dir() / "plugin.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} {what} "
+                    f"(Plus381 Tools {__version__}, Python {sys.version.split()[0]}, wx {wx.version()}, "
+                    f"{sys.platform})\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
+    return log
+
+
 def main(action, parent=None):
     """Run one action. Called by the API entry scripts (own process) and by
     the fallback buttons in the PCB editor (inside KiCad, parent = editor)."""
@@ -1163,4 +1156,6 @@ def main(action, parent=None):
         d.ShowModal()
         d.Destroy()
     except Exception:  # noqa: BLE001 - last resort: show instead of dying silently
-        wx.MessageBox(traceback.format_exc(), f"{TITLE}: unexpected error", wx.OK | wx.ICON_ERROR)
+        log = log_error(f"running '{action}'")
+        wx.MessageBox(traceback.format_exc() + f"\n\nAlso saved to {log}", f"{TITLE}: unexpected error",
+                      wx.OK | wx.ICON_ERROR)
