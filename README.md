@@ -16,4 +16,4 @@ click **Apply Pending Changes**.
 
 | Plugin | What it does |
 |---|---|
-| [Plus381 Tools](plus381-tools/) | Shared parts library for the team: import parts (vendor zip or LCSC number) with a symbol, footprint and 3D preview, publish them to GitHub, and keep everyone's library up to date automatically. |
+| [Plus381 Tools](plus381-tools/) | Shared parts library for the team: import parts (vendor zip or LCSC number) with a symbol, footprint and 3D preview, publish them to GitHub, and see a red dot when the team has new parts (one click to update). |

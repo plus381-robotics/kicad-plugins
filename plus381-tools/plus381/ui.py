@@ -14,7 +14,7 @@ from pathlib import Path
 import wx
 import wx.adv
 
-from . import __version__, autosync, github, importer, partsync, publish, svgdraw
+from . import __version__, github, importer, partsync, publish, svgdraw
 from .partsync import Conflict, GitError
 
 TITLE = "Plus381 Tools"
@@ -68,7 +68,60 @@ def run_busy(parent, message, fn, *args, **kwargs):
     return result.get("value")
 
 
+def to_front(win):
+    """Put a window in front of KiCad and give it the focus.
+
+    The API buttons run this plugin as its own program, and Windows doesn't
+    let a program that isn't the one in use bring its windows to the front:
+    they opened behind KiCad. Joining KiCad's input queue for a moment
+    lifts that, and "always on top" for an instant puts the window above
+    KiCad even if Windows still refuses the focus."""
+    if not win or not win.IsShown():
+        return
+    win.Raise()
+    if not sys.platform.startswith("win"):
+        return
+    import ctypes
+    from ctypes import wintypes
+    try:
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND] + [ctypes.c_int] * 4 + [wintypes.UINT]
+        for f in (u.SetForegroundWindow, u.BringWindowToTop):
+            f.argtypes = [wintypes.HWND]
+        hwnd = win.GetHandle()
+        fg = u.GetForegroundWindow()
+        if fg == hwnd:
+            return
+        mine, theirs = k.GetCurrentThreadId(), u.GetWindowThreadProcessId(fg, None)
+        joined = bool(fg) and theirs != mine and u.AttachThreadInput(mine, theirs, True)
+        flags = 0x0001 | 0x0002 | 0x0040  # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+        u.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags)  # HWND_TOPMOST
+        u.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+        if joined:
+            u.AttachThreadInput(mine, theirs, False)
+    except Exception:  # noqa: BLE001 - only cosmetic
+        pass
+
+
+class _App(wx.App):
+    """The plugin's own wx app (API buttons): brings every window it opens
+    to the front (see to_front)."""
+
+    def FilterEvent(self, event):
+        if event.GetEventType() == wx.wxEVT_SHOW and event.IsShown():
+            win = event.GetEventObject()
+            if isinstance(win, wx.TopLevelWindow):
+                wx.CallAfter(to_front, win)
+        return -1  # Event_Skip: handle the event normally
+
+
 def _message(parent, text, title, style):
+    if parent is None and wx.GetApp().__class__ is _App:
+        style |= wx.STAY_ON_TOP  # native message box: no wx window to bring forward
     dlg = wx.MessageDialog(parent, str(text), f"{TITLE}: {title}", style)
     set_icon(dlg, getattr(parent, "_icon_kind", None))
     answer = dlg.ShowModal()
@@ -95,13 +148,26 @@ def label(parent, text, bold=False, wrap=0, colour=None):
     return st
 
 
-def quick_sync(parent, cfg):
-    """Get the newest parts before doing anything. Failing to sync (offline)
-    is not fatal: the user can still work on their local copy."""
+def update_library(parent, cfg):
+    """Get the team's new and changed parts (the red dot on the buttons).
+    Returns a short report for the user."""
+    libs_before = set(partsync.libraries(cfg["parts_dir"]))
     try:
-        return run_busy(parent, "Getting the newest parts from the team...", partsync.run_sync, cfg, True)
+        st = run_busy(parent, "Getting the team's new parts...", partsync.run_sync, cfg, True, False)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "message": str(e)}
+        st = {"ok": False, "message": str(e)}
+    if not st.get("ok"):
+        return "Could not update the library:\n" + (st.get("message") or "unknown error")
+    files = st.get("new_files") or []
+    if not files:
+        return "The library is up to date."
+    names = sorted({publish.describe(f)[0] for f in files})
+    text = f"Library updated. New or changed from the team ({len(names)}):\n  " + "\n  ".join(names[:20])
+    if len(names) > 20:
+        text += f"\n  ... and {len(names) - 20} more"
+    if set(partsync.libraries(cfg["parts_dir"])) - libs_before:
+        text += "\n\nThe team added a new category: restart KiCad to see its library."
+    return text + "\n\nReopen the symbol/footprint chooser to see them."
 
 
 # --------------------------------------------------------------------------
@@ -173,25 +239,19 @@ def do_setup(log, parts_dir, name, email, auto, repo=None):
     if not problems:
         log(f"Registered {len(partsync.libraries(cfg['parts_dir']))} libraries in KiCad")
 
+    c = partsync.load_config()
+    c["check_updates"] = bool(auto)
+    partsync.save_config(c)
+    partsync.start_watcher()  # also writes the path variable once KiCad closes
     state = partsync.ensure_env_var(cfg["parts_dir"])
     if state == "pending":
-        autosync.start_configure_after_exit()
         log(f"Path variable {partsync.VAR} will be saved as soon as KiCad is closed")
     elif state == "ok":
         log(f"Path variable {partsync.VAR} = {parts_dir.as_posix()}")
     else:
         log("! " + state)
-
-    try:
-        if auto:
-            log("Background sync: " + autosync.install())
-        else:
-            autosync.uninstall()
-            log("Background sync: off")
-    except Exception as e:  # noqa: BLE001 - the library still works without it
-        problems.append(f"Background sync could not be turned on ({e}). The library still updates "
-                        "every time you use a Plus381 button.")
-        log("! " + problems[-1])
+    log("Check for new parts: " + ("on (red dot on Library status when the team has new parts)"
+                                   if auto else "off"))
     return cfg, problems
 
 
@@ -239,8 +299,7 @@ class SetupDialog(wx.Dialog):
         s.Add(label(p, "Name and e-mail are optional: they are filled in from your GitHub account when you "
                        "first publish.", wrap=520), 0, wx.LEFT | wx.RIGHT, PAD)
 
-        self.auto = wx.CheckBox(p, label="Keep the library up to date automatically while KiCad is open "
-                                         "(checks every minute)")
+        self.auto = wx.CheckBox(p, label="Check for new parts while KiCad is open (red dot on Library status)")
         self.auto.SetValue(True)
         s.Add(self.auto, 0, wx.ALL, PAD)
 
@@ -466,6 +525,8 @@ class ImportDialog(wx.Dialog):
         self.SetMinSize(self.GetSize())
         self.preview_gen = 0
         self.preview_timer = None
+        self.render_lock = threading.Lock()
+        self.drawn_key = self.drawn_gen = None
 
         self.file.Bind(wx.EVT_FILEPICKER_CHANGED, self.on_file)
         lcsc.Bind(wx.EVT_BUTTON, self.on_lcsc)
@@ -633,9 +694,14 @@ class ImportDialog(wx.Dialog):
             return
         self.preview_gen += 1
         gen = self.preview_gen
-        drawings = (sym, fp, self.dl.tmp / "preview" / f"{gen}-2d")
+        # The symbol/footprint drawings only change when another symbol or
+        # footprint is picked, not when the 3D offset/rotation changes.
+        key = (self.dl, sym.name if sym else None, fp.name if fp else None)
+        if key != self.drawn_key:
+            self.drawn_key, self.drawn_gen = key, gen
+            drawings = (gen, sym, fp, self.dl.tmp / "preview" / f"{gen}-2d")
+            threading.Thread(target=self.render_drawings, args=drawings, daemon=True).start()
         if not fp:
-            self.render_drawings(gen, *drawings)
             self.preview_status.SetLabel("No footprint selected.")
             return
         args = (fp, model, [c.GetValue() for c in self.off], [c.GetValue() for c in self.rot],
@@ -644,12 +710,16 @@ class ImportDialog(wx.Dialog):
                                      "Rendering (the first time takes a few seconds)...")
 
         def work():
-            try:
-                self.render_drawings(gen, *drawings)
-                importer.render_preview(*args, on_view=lambda n, png: wx.CallAfter(self.show_view, gen, n, png))
-                wx.CallAfter(self.preview_done, gen, None)
-            except Exception as e:  # noqa: BLE001 - preview is optional
-                wx.CallAfter(self.preview_done, gen, e)
+            # One render at a time; one that a newer change already replaced
+            # is skipped instead of keeping the computer busy.
+            with self.render_lock:
+                if gen != self.preview_gen:
+                    return
+                try:
+                    importer.render_preview(*args, on_view=lambda n, png: wx.CallAfter(self.show_view, gen, n, png))
+                    wx.CallAfter(self.preview_done, gen, None)
+                except Exception as e:  # noqa: BLE001 - preview is optional
+                    wx.CallAfter(self.preview_done, gen, e)
         threading.Thread(target=work, daemon=True).start()
 
     def render_drawings(self, gen, sym, fp, outdir):
@@ -665,7 +735,7 @@ class ImportDialog(wx.Dialog):
             wx.CallAfter(self.show_svg, gen, name, svg)
 
     def show_svg(self, gen, name, svg):
-        if gen != self.preview_gen or not self:
+        if gen != self.drawn_gen or not self:
             return
         w, h = self.PREVIEW_SIZE
         bmp = None
@@ -752,6 +822,22 @@ class ImportDialog(wx.Dialog):
 # Publish
 # --------------------------------------------------------------------------
 
+def nothing_to_publish(cfg):
+    """Why there's nothing to publish, and where edits that went missing
+    usually are."""
+    text = (f"Nothing to publish: the parts in {cfg['parts_dir']} match the team's.\n\n"
+            "Changed a part but it isn't listed?\n"
+            "- Edited from a board (Edit Footprint / Open in Footprint Editor)? KiCad then saves only "
+            "into that board. Open the part in the Footprint/Symbol Editor from its Plus381 library "
+            "and save it there (or File > Save As into a Plus381 library).\n"
+            "- Not saved yet? Save in the editor, then click Refresh.")
+    stray = partsync.misplaced_libraries(cfg["parts_dir"])
+    if stray:
+        text += ("\n- KiCad loads these team libraries from another folder, so edits to them land there "
+                 "(Library status > Update library fixes that; then restart KiCad):\n  " + "\n  ".join(stray))
+    return text
+
+
 class PublishDialog(wx.Dialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent, title=f"{TITLE}: Publish", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -767,9 +853,12 @@ class PublishDialog(wx.Dialog):
         s.Add(label(p, "Description:"), 0, wx.LEFT | wx.TOP | wx.RIGHT, PAD)
         self.msg = wx.TextCtrl(p)
         s.Add(self.msg, 0, wx.EXPAND | wx.ALL, PAD)
-        self.check = wx.TextCtrl(p, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(600, 110))
+        self.check = wx.TextCtrl(p, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(600, 190))
         s.Add(self.check, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, PAD)
         b = wx.BoxSizer(wx.HORIZONTAL)
+        refresh = wx.Button(p, label="Refresh")
+        refresh.Bind(wx.EVT_BUTTON, lambda e: self.refresh())
+        b.Add(refresh, 0, wx.RIGHT, PAD)
         self.go = wx.Button(p, label="Publish to team")
         b.Add(self.go, 0, wx.RIGHT, PAD)
         b.Add(wx.Button(p, wx.ID_CANCEL, label="Close"))
@@ -781,11 +870,11 @@ class PublishDialog(wx.Dialog):
 
     def refresh(self):
         self.list.DeleteAllItems()
+        error = None
         try:
             items = publish.pending_changes(self.cfg)
         except GitError as e:
-            items = []
-            self.check.SetValue(str(e))
+            items, error = [], e
         for name, kind, change, _ in items:
             i = self.list.InsertItem(self.list.GetItemCount(), name)
             self.list.SetItem(i, 1, kind)
@@ -793,8 +882,11 @@ class PublishDialog(wx.Dialog):
         self.items = items
         self.msg.SetValue(publish.default_message(items) if items else "")
         self.go.Enable(bool(items))
+        if error:
+            self.check.SetValue(f"Could not read your library's changes:\n{error}")
+            return
         if not items:
-            self.check.SetValue("Nothing to publish: your library matches the team's.")
+            self.check.SetValue(nothing_to_publish(self.cfg))
             return
         mine, other = self.problems()
         text = "Library check: no problems in your changes." if not mine else \
@@ -913,7 +1005,9 @@ class LoginDialog(wx.Dialog):
     user to approve it in the browser."""
 
     def __init__(self, parent, start):
-        super().__init__(parent, title=f"{TITLE}: Log in to GitHub")
+        # Stays on top: the code must stay readable while the browser is open.
+        super().__init__(parent, title=f"{TITLE}: Log in to GitHub",
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP)
         set_icon(self, "publish")
         self.start = start
         self.token = None
@@ -940,7 +1034,7 @@ class LoginDialog(wx.Dialog):
         p.SetSizer(s)
         s.Fit(self)
         copy.Bind(wx.EVT_BUTTON, self.on_copy)
-        open_.Bind(wx.EVT_BUTTON, lambda e: webbrowser.open(github.device_page(start)))
+        open_.Bind(wx.EVT_BUTTON, self.on_open)
         self.Bind(wx.EVT_BUTTON, self.on_cancel, id=wx.ID_CANCEL)
         open_.SetDefault()
         threading.Thread(target=self.wait, daemon=True).start()
@@ -950,6 +1044,10 @@ class LoginDialog(wx.Dialog):
             wx.TheClipboard.SetData(wx.TextDataObject(self.start["user_code"]))
             wx.TheClipboard.Close()
             self.status.SetLabel("Code copied. Paste it on the GitHub page.")
+
+    def on_open(self, _):
+        self.on_copy(None)  # ready to paste on the GitHub page
+        webbrowser.open(github.device_page(self.start))
 
     def on_cancel(self, _):
         self.cancelled = True
@@ -1006,9 +1104,9 @@ class StatusDialog(wx.Dialog):
         self.text = wx.TextCtrl(p, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(620, 300))
         s.Add(self.text, 1, wx.EXPAND | wx.ALL, PAD)
         b = wx.WrapSizer()
-        buttons = [("Sync now", self.on_sync), ("Check library", self.on_check),
+        buttons = [("Update library", self.on_sync), ("Check library", self.on_check),
                    ("Open library folder", lambda e: publish.open_folder(cfg["parts_dir"])),
-                   ("Background sync on/off", self.on_toggle), ("Run setup again", self.on_setup),
+                   ("Checking on/off", self.on_toggle), ("Run setup again", self.on_setup),
                    ("Log in to GitHub", self.on_login), ("Log out", self.on_logout)]
         for text, fn in buttons:
             btn = wx.Button(p, label=text)
@@ -1018,6 +1116,7 @@ class StatusDialog(wx.Dialog):
         s.Add(b, 0, wx.ALL, PAD - 3)
         p.SetSizer(s)
         s.Fit(self)
+        run_busy(parent, "Checking for new parts...", partsync.run_check, cfg)
         self.refresh()
 
     def refresh(self, extra=""):
@@ -1031,14 +1130,14 @@ class StatusDialog(wx.Dialog):
             pending = len(publish.pending_changes(cfg))
         except GitError:
             pending = "?"
-        auto = autosync.installed()
+        auto = partsync.load_config().get("check_updates", True)
         lines = [
             f"Repository:       {partsync.repo_url(cfg)}",
             f"Library folder:   {cfg['parts_dir']}",
             f"Contents:         {len(libs)} libraries, {n_sym} symbols, {n_fp} footprints, {n_3d} 3D models",
-            f"Last sync:        {st.get('time', 'never')}  {'OK' if st.get('ok') else 'PROBLEM'}",
-            f"Last new parts:   {st.get('last_update') or '-'}",
-            f"Background sync:  {'on (every minute while KiCad is open)' if auto else 'OFF - library only updates when you use the plugin'}",
+            f"Last update:      {st.get('time', 'never')}  {'OK' if st.get('ok') else 'PROBLEM'}",
+            f"Team updates:     {self.updates_line(st)}",
+            f"Checking:         {'every 2 minutes while KiCad is open (red dot on Library status)' if auto else 'OFF - only when Library status opens'}",
             f"Path variable:    {'ok' if partsync.env_var_ok(cfg['parts_dir']) else 'not set yet - close KiCad completely and open it again'}",
             f"Unpublished:      {pending} change(s)",
             f"GitHub:           {self.github_line()}",
@@ -1052,6 +1151,17 @@ class StatusDialog(wx.Dialog):
         if extra:
             lines += ["", extra]
         self.text.SetValue("\n".join(lines))
+
+    @staticmethod
+    def updates_line(st):
+        if st.get("check_error"):
+            return "could not check (" + st["check_error"].splitlines()[-1][:80] + ")"
+        n = int(st.get("updates") or 0)
+        if not n:
+            return f"none, you have everything (checked {st.get('checked') or 'never'})"
+        names = st.get("update_parts") or []
+        what = ", ".join(names[:6]) + (", ..." if len(names) > 6 else "") if names else f"{n} file(s)"
+        return f"NEW PARTS WAITING: {what}  ->  click Update library"
 
     def github_line(self):
         c = partsync.load_config()
@@ -1072,25 +1182,17 @@ class StatusDialog(wx.Dialog):
         self.refresh("Logged out of GitHub.")
 
     def on_sync(self, _):
-        try:
-            st = run_busy(self, "Syncing...", partsync.run_sync, self.cfg, True)
-        except Exception as e:  # noqa: BLE001
-            error(self, e)
-            st = {}
-        self.refresh(f"Received {len(st.get('new_files', []))} changed file(s)." if st.get("ok") else "")
+        self.refresh(update_library(self, self.cfg))
 
     def on_check(self, _):
         ok, out = publish.run_check(self.cfg)
         self.refresh("Library check:\n" + out)
 
     def on_toggle(self, _):
-        try:
-            if autosync.installed():
-                autosync.uninstall()
-            else:
-                autosync.install()
-        except Exception as e:  # noqa: BLE001
-            error(self, e)
+        c = partsync.load_config()
+        c["check_updates"] = not c.get("check_updates", True)
+        partsync.save_config(c)
+        partsync.start_watcher()
         self.refresh()
 
     def on_setup(self, _):
@@ -1129,7 +1231,7 @@ def main(action, parent=None):
     global _app, CURRENT_ICON
     CURRENT_ICON = {"import": "import", "publish": "publish", "setup": "setup"}.get(action, "status")
     if not wx.GetApp():
-        _app = wx.App(False)  # must stay alive while the dialogs run
+        _app = _App(False)  # must stay alive while the dialogs run
         # Linux taskbars name and group windows by this (else "import_part.py").
         _app.SetAppName("plus381-tools")
         _app.SetClassName("Plus381 Tools")
@@ -1138,7 +1240,7 @@ def main(action, parent=None):
         cfg = ensure_setup(parent)
         if not cfg:
             return
-        autosync.refresh_script()
+        partsync.start_watcher()
         if sys.prefix != sys.base_prefix:
             # Remember the plugin's environment for the fallback buttons
             # (it has easyeda2kicad installed).
@@ -1146,16 +1248,14 @@ def main(action, parent=None):
             if c.get("plugin_python") != sys.executable:
                 c["plugin_python"] = sys.executable
                 partsync.save_config(c)
-        if action != "setup":
-            st = quick_sync(parent, cfg)
-            if not st.get("ok") and st.get("message"):
-                wx.MessageBox("Could not get the newest parts (you can keep working):\n\n" + st["message"],
-                              TITLE, wx.OK | wx.ICON_WARNING, parent)
+        if action == "update":
+            info(parent, update_library(parent, cfg), "Update library")
+            return
         dlg = {"import": ImportDialog, "publish": PublishDialog, "status": StatusDialog}.get(action, StatusDialog)
         d = dlg(cfg, parent)
         d.ShowModal()
         d.Destroy()
     except Exception:  # noqa: BLE001 - last resort: show instead of dying silently
         log = log_error(f"running '{action}'")
-        wx.MessageBox(traceback.format_exc() + f"\n\nAlso saved to {log}", f"{TITLE}: unexpected error",
-                      wx.OK | wx.ICON_ERROR)
+        _message(parent, traceback.format_exc() + f"\n\nAlso saved to {log}", "unexpected error",
+                 wx.OK | wx.ICON_ERROR)

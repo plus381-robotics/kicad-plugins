@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Keep the Plus381 parts library in sync and registered in KiCad.
 
-This file only uses the Python standard library. It is imported by the
-Plus381 Tools plugin and is also copied to the user's config folder, where
-the operating system's scheduler runs it every minute. It only syncs while
-KiCad is open; when KiCad is closed it just makes sure KiCad's settings are
-complete and exits without touching the network:
+This file only uses the Python standard library, so it also runs on its
+own, outside the plugin:
 
+    python partsync.py watch              check for new parts while KiCad is open (see watch())
+    python partsync.py check              check once whether the team has new parts
     python partsync.py sync [--quiet]     get the newest parts, push unpublished ones
-    python partsync.py sync --always      sync even when KiCad is closed
     python partsync.py configure-kicad    write KiCad settings (waits until KiCad is closed)
 """
 
@@ -78,7 +76,18 @@ def load_status():
 
 
 def save_status(st):
+    """After a sync: also clears the "new parts waiting" mark."""
     st["time"] = datetime.now().isoformat(timespec="seconds")
+    if st.get("ok"):
+        st.update(updates=0, update_parts=[])
+    else:
+        old = load_status()
+        st.setdefault("updates", old.get("updates", 0))
+        st.setdefault("update_parts", old.get("update_parts", []))
+    _write_status(st)
+
+
+def _write_status(st):
     status_path().write_text(json.dumps(st, indent=2), encoding="utf-8")
 
 
@@ -398,6 +407,31 @@ def ensure_lib_tables(parts_dir):
     return problems
 
 
+def misplaced_libraries(parts_dir):
+    """Team libraries that KiCad loads from somewhere other than parts_dir
+    (left over from an older setup, or added by hand). Edits saved to them
+    never reach the team. Returns ["nickname: path", ...]."""
+    root = os.path.normcase(os.path.realpath(parts_dir))
+    prefix = lib_prefix(parts_dir)
+    out = []
+    for cfgdir in kicad_config_dirs():
+        for table in ("sym-lib-table", "fp-lib-table"):
+            try:
+                text = (cfgdir / table).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for s, e, name in _lib_entries(text):
+                block = text[s:e]
+                if not (name.startswith(prefix) or MANAGED_MARK in block):
+                    continue
+                m = re.search(r'\(uri\s+"((?:[^"\\]|\\.)*)"\)', block)
+                uri = (m.group(1) if m else "").replace("${%s}" % VAR, str(parts_dir))
+                path = os.path.normcase(os.path.realpath(os.path.expandvars(uri)))
+                if path != root and not path.startswith(root + os.sep):
+                    out.append(f"{name}: {uri}")
+    return sorted(set(out))
+
+
 def env_var_ok(parts_dir):
     want = Path(parts_dir).as_posix()
     dirs = kicad_config_dirs()
@@ -449,7 +483,7 @@ def configure_kicad(parts_dir):
 # --------------------------------------------------------------------------
 
 class Lock:
-    """Stops the scheduler and the plugin from running git at the same time."""
+    """Stops the background sync and the plugin from running git at the same time."""
 
     def __init__(self, wait=60):
         self.path = app_dir() / "sync.lock"
@@ -549,11 +583,43 @@ def sync(cfg, push=True):
     return st
 
 
-def run_sync(cfg, quiet=False):
-    """sync() with error handling and status file, used by the scheduler."""
+def check_updates(cfg):
+    """Look at GitHub for parts the team added or changed, without changing
+    anything locally (git fetch only). Returns the number of changed files
+    and the names of the changed parts."""
+    with Lock():
+        git(cfg, "fetch", "--quiet", "origin", BRANCH)
+        _, behind = ahead_behind(cfg)
+        names = []
+        if behind:
+            out = git(cfg, "diff", "--name-only", f"HEAD...origin/{BRANCH}").stdout.split()
+            for path in out:
+                name, ext = os.path.splitext(os.path.basename(path))
+                if ext in (".kicad_sym", ".kicad_mod") and name not in names:
+                    names.append(name)
+            return len(out), names
+    return 0, names
+
+
+def run_check(cfg):
+    """check_updates() with its result in the status file, where the toolbar
+    buttons (red dot) and Library status read it."""
+    st = load_status()
     try:
-        st = sync(cfg)
-    except Exception as e:  # noqa: BLE001 - keep the scheduler alive, report instead
+        n, names = check_updates(cfg)
+        st.update(updates=n, update_parts=names, check_error="")
+    except Exception as e:  # noqa: BLE001 - offline etc.: keep the last result
+        st["check_error"] = str(e)
+    st["checked"] = datetime.now().isoformat(timespec="seconds")
+    _write_status(st)
+    return st
+
+
+def run_sync(cfg, quiet=False, push=True):
+    """sync() with error handling and the result in the status file."""
+    try:
+        st = sync(cfg, push=push)
+    except Exception as e:  # noqa: BLE001 - report instead of crashing
         st = {"ok": False, "message": str(e)}
     old = load_status()
     if st.get("new_files"):
@@ -568,9 +634,139 @@ def run_sync(cfg, quiet=False):
     return st
 
 
+# --------------------------------------------------------------------------
+# Checking for new parts while KiCad is open
+# --------------------------------------------------------------------------
+
+CHECK_EVERY = 120   # seconds between looks at GitHub while KiCad is open
+KICAD_EVERY = 15    # seconds between "is KiCad still open?" checks
+
+
+def start_watcher():
+    """Start the background check for new parts. Called whenever the plugin
+    runs: when the PCB editor opens (it loads the plugin) and on every
+    Plus381 button. A second copy notices the first one and exits at once."""
+    py = base_python()
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+              "cwd": str(app_dir())}
+    if IS_WIN:
+        pyw = Path(py).with_name("pythonw.exe")
+        py = str(pyw) if pyw.exists() else py
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([py, os.path.abspath(__file__), "watch"], **kwargs)
+    except OSError:
+        pass  # Library status still checks when it opens
+
+
+def _only_watcher():
+    """Hold watch.lock while this process lives; None if another watcher holds it."""
+    f = open(app_dir() / "watch.lock", "a+")
+    try:
+        if IS_WIN:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def watch():
+    """Every CHECK_EVERY seconds while KiCad is open, look whether the team
+    has new parts (fetch only: nothing in the library changes until the
+    user clicks Update). When KiCad closes, write its settings (KiCad
+    overwrites them while it runs) and exit."""
+    lock = _only_watcher()
+    if not lock:
+        return 0
+    remove_old_scheduler()
+    me = os.path.abspath(__file__)
+    code = Path(me).read_bytes()
+    last = 0.0
+    closed = 0
+    while True:
+        try:
+            changed = Path(me).read_bytes() != code
+        except OSError:
+            return 0  # plugin uninstalled
+        if changed:  # plugin updated: continue with the new code
+            lock.close()
+            os.execv(sys.executable, [sys.executable, me, "watch"])
+        cfg = load_config()
+        if kicad_running():
+            closed = 0
+            if cfg.get("check_updates", True) and is_repo(cfg) and time.time() - last >= CHECK_EVERY:
+                run_check(cfg)
+                last = time.time()
+        else:
+            closed += 1
+            if closed >= 2:  # seen closed twice: not just restarting
+                if is_repo(cfg):
+                    configure_kicad(cfg["parts_dir"])
+                return 0
+        time.sleep(KICAD_EVERY)
+
+
+def remove_old_scheduler():
+    """Versions before 0.7 synced through the system scheduler (Task
+    Scheduler, launchd, systemd or cron), every minute. Remove that once."""
+    cfg = load_config()
+    if cfg.get("old_scheduler_removed"):
+        return
+
+    def run(*cmd, input=None):
+        try:
+            return subprocess.run(list(cmd), capture_output=True, text=True, input=input, timeout=60,
+                                  **_hidden())
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    gone = True
+    if IS_WIN:
+        run("schtasks", "/Delete", "/F", "/TN", "Plus381 Parts Sync")
+        r = run("schtasks", "/Query", "/TN", "Plus381 Parts Sync")
+        gone = r is not None and r.returncode != 0
+    elif IS_MAC:
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.plus381.partsync.plist"
+        if plist.exists():
+            run("launchctl", "bootout", f"gui/{os.getuid()}", str(plist))
+            plist.unlink()
+    else:
+        if shutil.which("systemctl"):
+            run("systemctl", "--user", "disable", "--now", "plus381-partsync.timer")
+            d = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+            for f in (d / "plus381-partsync.service", d / "plus381-partsync.timer"):
+                if f.exists():
+                    f.unlink()
+            run("systemctl", "--user", "daemon-reload")
+        if shutil.which("crontab"):
+            r = run("crontab", "-l")
+            if r is not None and r.returncode == 0 and "# plus381-partsync" in r.stdout:
+                keep = "".join(l + "\n" for l in r.stdout.splitlines() if "# plus381-partsync" not in l)
+                run("crontab", "-", input=keep)
+    if not gone:
+        return  # try again next time; its script stays so it keeps working meanwhile
+    for name in ("partsync.py", "partsync.vbs"):
+        try:
+            (app_dir() / name).unlink()
+        except OSError:
+            pass
+    cfg = load_config()
+    cfg["old_scheduler_removed"] = True
+    cfg.pop("plugin_partsync", None)
+    save_config(cfg)
+
+
 def update_self(cfg, argv):
-    """The scheduler runs a copy of this file. When the plugin was updated,
-    take the plugin's newer version and restart with it."""
+    """An old scheduler job runs a copy of this file (see
+    remove_old_scheduler). Until it is removed, let it run the newest code."""
     src = cfg.get("plugin_partsync")
     me = os.path.abspath(__file__)
     try:
@@ -585,20 +781,26 @@ def update_self(cfg, argv):
 def main(argv):
     cfg = load_config()
     update_self(cfg, argv)
+    cmd = argv[1] if len(argv) > 1 else "sync"
+    if cmd == "watch":
+        return watch()
     if not is_repo(cfg):
         print("Plus381 parts library is not set up (run Setup in the KiCad plugin).")
         return 1
-    cmd = argv[1] if len(argv) > 1 else "sync"
+    if cmd == "check":
+        st = run_check(cfg)
+        print(json.dumps({k: st.get(k) for k in ("updates", "update_parts", "check_error")}, indent=2))
+        return 0
     if cmd == "sync":
         if "--always" not in argv and not kicad_running():
-            # KiCad closed: nothing to sync for. This is also the moment the
-            # path variable can be written safely (KiCad rewrites it on close).
+            # KiCad closed (an old scheduler job): nothing to sync for. Also
+            # the moment the path variable can be written safely.
             ensure_env_var(cfg["parts_dir"])
             return 0
         st = run_sync(cfg, quiet="--quiet" in argv)
         return 0 if st.get("ok") else 1
     if cmd == "configure-kicad":
-        # Started by Setup: wait (up to 12 h) until KiCad is closed, then write settings.
+        # Wait (up to 12 h) until KiCad is closed, then write settings.
         deadline = time.time() + 12 * 3600
         while kicad_running() and time.time() < deadline:
             time.sleep(2)

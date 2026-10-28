@@ -1,6 +1,7 @@
 """Turn a vendor download (SnapEDA, Mouser/SamacSys, UltraLibrarian,
 DigiKey, LCSC, ...) into a part in the Plus381 library."""
 
+import concurrent.futures
 import filecmp
 import json
 import os
@@ -716,7 +717,8 @@ def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=N
         preview_board(text, boards[kind], placed[:4] if placed else None, min_size=factor * height)
     results = {}
     env = _preview_env()
-    for name in views or PREVIEW_VIEWS:
+
+    def render(name):
         png = outdir / f"{name}.png"
         if png.exists():
             png.unlink()
@@ -728,6 +730,12 @@ def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=N
             results[name] = png
             if on_view:
                 on_view(name, png)
+
+    # All views at once: most of each kicad-cli run is starting up and
+    # loading the model, which is slow on Windows, so this is ~4x faster.
+    names = list(views or PREVIEW_VIEWS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(names), os.cpu_count() or 1))) as pool:
+        list(pool.map(render, names))
     return results
 
 

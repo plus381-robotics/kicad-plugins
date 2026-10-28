@@ -9,6 +9,10 @@ plugin folder as a classic action plugin, which gives:
   - the three actions under Tools > External Plugins.
 
 They open the same windows, running inside the PCB editor itself.
+
+Loading this file also starts the background check for new parts (every 2
+minutes while KiCad is open) and the red dot that the Plus381 buttons get
+when the team has new parts (see plus381/badge.py).
 """
 
 import os
@@ -40,6 +44,14 @@ def _run(action):
 
 
 if pcbnew is not None:
+    try:
+        from plus381 import partsync
+        if partsync.is_repo(partsync.load_config()):
+            partsync.start_watcher()
+            from plus381 import badge
+            badge.start()
+    except Exception:  # noqa: BLE001 - never break loading the PCB editor
+        pass
 
     class _Chooser(pcbnew.ActionPlugin):
         def defaults(self):
@@ -52,11 +64,16 @@ if pcbnew is not None:
 
         def Run(self):
             import wx
+            from plus381 import partsync
+            actions = list(ACTIONS)
+            n = int(partsync.load_status().get("updates") or 0)
+            if n:  # the button shows a red dot: offer the update first
+                actions.insert(0, ("update", "Update library (the team has new parts)"))
             dlg = wx.SingleChoiceDialog(_editor_window(), "What do you want to do?", "Plus381 Tools",
-                                        [label for _, label in ACTIONS])
-            dlg.SetSize((320, 300))
+                                        [label for _, label in actions])
+            dlg.SetSize((360, 300))
             if dlg.ShowModal() == wx.ID_OK:
-                action = ACTIONS[dlg.GetSelection()][0]
+                action = actions[dlg.GetSelection()][0]
                 dlg.Destroy()
                 _run(action)
             else:

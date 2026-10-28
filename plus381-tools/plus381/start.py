@@ -44,13 +44,13 @@ def _report(action):
         import wx
         if not wx.GetApp():
             wx.App(False)
-        wx.MessageBox(text, "Plus381 Tools: could not start", wx.OK | wx.ICON_ERROR)
+        wx.MessageBox(text, "Plus381 Tools: could not start", wx.OK | wx.ICON_ERROR | wx.STAY_ON_TOP)
         return
     except Exception:  # noqa: BLE001 - wx itself may be what's broken
         pass
     if sys.platform == "win32":
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, text, "Plus381 Tools: could not start", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, text, "Plus381 Tools: could not start", 0x10 | 0x10000 | 0x40000)  # error, foreground, topmost
 
 
 def run(action, parent=None):

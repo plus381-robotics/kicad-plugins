@@ -45,16 +45,30 @@ therefore adds a **fallback** that KiCad loads directly into the PCB editor:
 They open the same windows. Only importing by LCSC number needs the normal
 buttons to have run once first (KiCad installs the LCSC converter for them).
 
+### Troubleshooting
+
+* **Nothing happens when you click a button:** errors are shown in a message
+  box and saved to `plugin.log` in the settings folder (Windows:
+  `%APPDATA%\plus381\plugin.log`). Send that file when asking for help.
+* **"Execution of command `...\KiCad\9.0\bin\pythonw.exe -m venv ...` failed":**
+  KiCad still points at the Python of an old KiCad. In **Preferences →
+  Plugins**, click *Detect automatically* next to *Python interpreter* (or
+  pick `C:\Program Files\KiCad\10.0\bin\pythonw.exe`), close KiCad, delete
+  `%LOCALAPPDATA%\KiCad\10.0\python-environments\com.plus381.tools` and
+  start KiCad again.
+* **Publish says "Nothing to publish" after an edit:** see *Fix or improve a
+  part* below; the Publish window also lists the likely reason.
+
 ## Daily use
 
 | Task | How |
 |---|---|
-| Get new parts | Nothing to do. While KiCad is open, the library updates itself every minute (and right away whenever you click a Plus381 button). Reopen the footprint/symbol chooser to see new parts. |
+| Get new parts | When the team has new or changed parts, the **Library status** button (and the fallback **381** button) gets a **red dot**; its tooltip names the parts. Click **Library status → Update library** (or **381 → Update library**). Nothing changes in your library until you do. Then reopen the footprint/symbol chooser. |
 | Add a part from LCSC | **Import part** → type the LCSC number (e.g. `C8734`) → **Get from LCSC** (or Enter). Symbol, footprint and 3D model are downloaded and converted automatically (via [easyeda2kicad](https://github.com/uPesy/easyeda2kicad.py)); the `LCSC Part` field is kept for JLCPCB assembly. Typing a manufacturer part number instead opens the LCSC search so you can find the C number. |
 | Add a part from a vendor zip | Download the part's KiCad zip from SnapEDA / Mouser / UltraLibrarian / DigiKey → **Import part** → pick the zip. **Find on DigiKey** opens DigiKey for a part number; there, *EDA/CAD Models* downloads the KiCad zip (needs a free login; DigiKey has no API for CAD files). |
 | Then, for both | Pick a category (each shows its description) → check the **preview** (symbol, footprint and 3D from four sides; fix the 3D offset/rotation, **Vendor values** undoes your changes) → **Import** → **Publish**. |
-| Fix or improve a part | Edit it in the Symbol / Footprint Editor (it's already in the `Plus381_*` libraries), save, then **Publish**. |
-| See what's going on | **Library status**: last sync, background sync on/off, unpublished changes, library check, re-run setup. |
+| Fix or improve a part | Open it from its `Plus381_*` library in the Symbol / Footprint Editor, edit, save, then **Publish**. Editing a footprint from a board (*Edit Footprint* / *Open in Footprint Editor*) only changes that board: use *Save As* into the `Plus381_*` library to share it. |
+| See what's going on | **Library status**: new parts waiting, update, unpublished changes, library check, re-run setup, checking on/off. |
 
 If someone else changed the same part at the same time, the plugin asks
 whose version to keep and backs up the other one.
@@ -101,16 +115,22 @@ a new, empty library folder.
   3D models (`${PLUS381_PARTS}/3dmodels/...`). KiCad rewrites its settings when
   it closes, so the variable is written by a small helper right after KiCad
   exits. That's why you restart KiCad once.
-* **Background sync** is a job in your operating system's scheduler (Windows
-  Task Scheduler, a macOS LaunchAgent, or a systemd user timer / cron on
-  Linux). It runs `partsync.py` every minute with KiCad's own Python. It only
-  syncs while KiCad is open: when KiCad is closed it exits immediately without
-  going online, so new parts arrive within a minute of opening KiCad. (KiCad
-  can't start plugins by itself on startup, which is why a scheduler job is
-  used.) It only fast-forwards: it never overwrites files you are editing and never
-  publishes on its own, except for retrying a Publish that failed while
-  you were offline. It also re-registers new categories and repairs the path
-  variable if needed.
+* **Checking for new parts** is a small background process (`partsync.py
+  watch`, KiCad's own Python). Every 2 minutes while KiCad is open it asks
+  GitHub whether the team has new parts (`git fetch` only: your library
+  doesn't change) and writes the answer to `status.json`. Inside KiCad, the
+  plugin reads that file and draws the red dot on its toolbar buttons.
+  KiCad can't start plugins by itself, so the check starts when the PCB
+  editor opens (KiCad loads the plugin's fallback buttons there) or when you
+  click any Plus381 button; a second copy sees the first and quits. When
+  KiCad closes, it writes KiCad's settings (the path variable) and exits.
+  The red dot needs the PCB editor to have been opened once in that KiCad
+  session (the schematic editor can't run plugin code); **Library status**
+  always checks when it opens. No system scheduler is used (versions before
+  0.7 used one; it is removed automatically).
+* **Update library** fast-forwards to the team's version. It never
+  overwrites files you are editing. Publishing also brings in the team's
+  newest version (your changes go on top of it).
 * **Import** converts the vendor files to the current KiCad format with
   `kicad-cli`. It stores the symbol and footprint as one file each (so two
   people adding parts never conflict) and links symbol → footprint → 3D
@@ -131,7 +151,7 @@ Settings and logs live in `%APPDATA%\plus381` (Windows),
 
 ## Uninstall
 
-**Library status → Background sync on/off** (turn it off), uninstall the
+Uninstall the
 plugin in the Plugin and Content Manager, and remove the `Plus381_*` entries
 in **Preferences → Manage Symbol/Footprint Libraries**.
 
@@ -142,8 +162,10 @@ plus381-tools/
   plugin.json            KiCad API plugin manifest (3 toolbar actions)
   pcm.json               Plugin and Content Manager metadata
   import_part.py, publish.py, library_status.py   entry points
-  plus381/partsync.py    git sync + KiCad settings (standard library only; also run by the scheduler)
-  plus381/autosync.py    installs the background job per OS
+  plus381/partsync.py    git sync, background check for new parts, KiCad settings (standard library only)
+  plus381/badge.py       red dot on the toolbar buttons (runs inside KiCad)
+  plus381/start.py       starts an action; shows + logs startup errors
+  plus381/svgdraw.py     draws kicad-cli's SVGs (KiCad's Windows wxPython has no wx.svg)
   plus381/importer.py    vendor zip -> library part
   plus381/publish.py     commit / push / conflict handling
   plus381/github.py      in-plugin GitHub login (device flow), fork + pull request

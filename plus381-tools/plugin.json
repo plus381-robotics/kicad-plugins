@@ -31,7 +31,7 @@
     {
       "identifier": "library-status",
       "name": "Plus381: Library status",
-      "description": "Sync status, setup, background sync and library check",
+      "description": "Get the team's new parts (red dot = new parts waiting), setup and library check",
       "show-button": true,
       "scopes": ["pcb", "schematic", "footprint", "symbol", "project_manager"],
       "entrypoint": "library_status.py",
