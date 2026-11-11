@@ -24,14 +24,17 @@ jobs:
 
       - name: Lint
         run: |
-          pip install pyflakes jsonschema
-          python3 -m pyflakes plus381-tools pcm
+          pip install pyflakes
+          python3 -m pyflakes plus381-tools pcm tests
           python3 -c "import json; json.load(open('plus381-tools/plugin.json'))"
+
+      - name: Test
+        run: python3 -m unittest discover -s tests -v
 
       - uses: actions/configure-pages@v5
 
       - name: Build PCM repository
-        run: python3 pcm/build.py --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+        run: python3 pcm/build.py --check-published --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
 
       - uses: actions/upload-pages-artifact@v3
         with:

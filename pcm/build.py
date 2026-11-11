@@ -9,6 +9,11 @@ Output in dist/ (published to GitHub Pages by .github/workflows/pcm.yml):
     packages.json
     resources.zip     (package icons)
     packages/<identifier>-<version>.zip
+    versions.json     (version and content hash of each plugin, for --check-published)
+
+With --check-published the build fails when a plugin's files differ from the
+published ones but its version is the same: KiCad would not offer that as an
+update, and the same version number would mean two different programs.
 
 Each plugin folder needs plugin.json, a plus381/__init__.py-style __version__
 (or a "version" entry in pcm.json) and a pcm.json with the package metadata.
@@ -20,6 +25,8 @@ import io
 import json
 import re
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,12 +66,15 @@ def build_package(d, base_url, out):
 
     buf = io.BytesIO()
     install_size = 0
+    content = hashlib.sha256()  # of what gets installed, independent of zip details
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("metadata.json", json.dumps(pkg_meta, indent=2))
         for f in files:
             data = f.read_bytes()
             install_size += len(data)
-            z.writestr("plugins/" + f.relative_to(d).as_posix(), data)
+            rel = f.relative_to(d).as_posix()
+            content.update(f"{rel}\0{len(data)}\0".encode() + data)
+            z.writestr("plugins/" + rel, data)
         icon = d / meta.get("icon", "icons/plugin-64.png")
         if icon.exists():
             z.writestr("resources/icon.png", icon.read_bytes())
@@ -77,27 +87,53 @@ def build_package(d, base_url, out):
     entry["versions"] = [dict(pkg_meta["versions"][0], download_url=base_url + "packages/" + name,
                               download_sha256=sha256(data), download_size=len(data), install_size=install_size)]
     icon_bytes = icon.read_bytes() if icon.exists() else None
-    return entry, ident, icon_bytes
+    return entry, ident, icon_bytes, content.hexdigest()
+
+
+def published_versions(base):
+    """versions.json of the repository that is online now ({} if there is none yet)."""
+    try:
+        with urllib.request.urlopen(base + "versions.json", timeout=30) as r:
+            data = json.loads(r.read().decode())
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        print(f"note: no published versions.json to compare with ({e})")
+        return {}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True, help="public URL where dist/ will be served, ending in /")
     ap.add_argument("--out", default=str(ROOT / "dist"))
+    ap.add_argument("--check-published", action="store_true",
+                    help="fail if a plugin changed since the published build without a new version number")
     args = ap.parse_args()
     base = args.base_url.rstrip("/") + "/"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     packages = []
+    versions = {}
     res = io.BytesIO()
     with zipfile.ZipFile(res, "w", zipfile.ZIP_DEFLATED) as z:
         for d in plugin_dirs():
-            entry, ident, icon = build_package(d, base, out)
+            entry, ident, icon, content = build_package(d, base, out)
             packages.append(entry)
+            versions[ident] = {"version": entry["versions"][0]["version"], "content_sha256": content}
             if icon:
                 z.writestr(f"{ident}/icon.png", icon)
             print(f"built {ident} {entry['versions'][0]['version']}")
+
+    if args.check_published:
+        online = published_versions(base)
+        stale = [f"{ident} {v['version']}" for ident, v in versions.items()
+                 if isinstance(online.get(ident), dict) and online[ident].get("version") == v["version"]
+                 and online[ident].get("content_sha256") != v["content_sha256"]]
+        if stale:
+            raise SystemExit("These plugins changed but still have the published version number: "
+                             + ", ".join(stale) + ".\nBump __version__ (or 'version' in pcm.json) so that "
+                             "KiCad offers the change as an update.")
+    (out / "versions.json").write_text(json.dumps(versions, indent=2))
 
     now = int(time.time())
     utc = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

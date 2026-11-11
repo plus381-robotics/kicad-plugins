@@ -1,0 +1,32 @@
+name: Tests
+
+# Lint and tests for pull requests (pushes to main run them in the publish
+# workflow, before anything is published).
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]  # 3.9: the oldest Python plugin.json allows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Lint
+        run: |
+          pip install pyflakes
+          python -m pyflakes plus381-tools pcm tests
+          python -c "import json; json.load(open('plus381-tools/plugin.json'))"
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
