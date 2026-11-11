@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -174,6 +175,18 @@ def update_library(parent, cfg):
 # Setup
 # --------------------------------------------------------------------------
 
+def _remove_tree(path):
+    """Delete a folder, including Git's read-only files (on Windows a plain
+    rmtree leaves those behind, and the next Setup finds a non-empty folder)."""
+    def retry(fn, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            fn(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, **{"onexc" if sys.version_info >= (3, 12) else "onerror": retry})
+
+
 def _same_repo(a, b):
     def norm(u):
         u = u.strip().lower().rstrip("/")
@@ -215,7 +228,7 @@ def do_setup(log, parts_dir, name, email, auto, repo=None):
         r = subprocess.run([gitexe, "clone", repo, str(parts_dir)], capture_output=True,
                            text=True, env=env, **hidden)
         if r.returncode != 0 or not (parts_dir / "categories.json").exists():
-            shutil.rmtree(parts_dir, ignore_errors=True)  # don't leave a half download behind
+            _remove_tree(parts_dir)  # don't leave a half download behind
             if r.returncode == 0:
                 raise GitError(f"{repo} is not a parts library: it has no categories.json. Start your own "
                                "library from a copy of github.com/plus381-robotics/kicad-parts.")
@@ -263,8 +276,8 @@ class SetupDialog(wx.Dialog):
         p = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
         s.Add(label(p, "Connect this computer to the parts library", bold=True), 0, wx.ALL, PAD)
-        s.Add(label(p, "This downloads the parts library, adds its libraries to KiCad and keeps them up to "
-                       "date in the background. You only do this once per computer.", wrap=520),
+        s.Add(label(p, "This downloads the parts library, adds its libraries to KiCad and tells you when the "
+                       "team has new parts. You only do this once per computer.", wrap=520),
               0, wx.LEFT | wx.RIGHT, PAD)
 
         g = wx.FlexGridSizer(2, PAD, PAD)
@@ -689,9 +702,9 @@ class ImportDialog(wx.Dialog):
         self.preview_timer = wx.CallLater(400, self.start_preview)
 
     def start_preview(self):
-        sym, fp, model = self.current()
         if not self.dl:
             return
+        sym, fp, model = self.current()
         self.preview_gen += 1
         gen = self.preview_gen
         # The symbol/footprint drawings only change when another symbol or
@@ -942,8 +955,7 @@ class PublishDialog(wx.Dialog):
         try:
             token = run_busy(self, "Checking your GitHub login...", github.get_token, self.cfg)
             if token:
-                mode = run_busy(self, "Checking your GitHub login...",
-                                lambda: "direct" if github.can_push(token) else "pr")
+                mode = run_busy(self, "Checking your GitHub login...", github.publish_mode, token)
                 return token, mode
         except github.GitHubError as e:
             if " 401 " not in str(e) + " ":
@@ -969,29 +981,34 @@ class PublishDialog(wx.Dialog):
                              wx.YES_NO | wx.ICON_INFORMATION, self) == wx.YES:
                 webbrowser.open(url)
         else:
-            info(self, "Published. Everyone gets your changes within a minute.", "Published")
+            info(self, "Published. Your teammates see a red dot on Library status within a few minutes and "
+                       "get your changes with Update library.", "Published")
 
     def conflict(self, c):
         names = "\n".join("- " + publish.describe(f)[0] for f in c.files)
         dlg = wx.MessageDialog(self, "Someone else changed the same part(s) while you were working:\n" + names +
-                               "\n\nWhich version should the team keep?", TITLE,
-                               wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
+                               "\n\nWhich version of these should the team keep? (Your other changes are "
+                               "published either way.)", TITLE, wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
         dlg.SetYesNoCancelLabels("Keep mine", "Keep theirs", "Decide later")
         ans = dlg.ShowModal()
         dlg.Destroy()
+        keep = {wx.ID_YES: "mine", wx.ID_NO: "theirs"}.get(ans)
+        if not keep:
+            return
         try:
-            if ans == wx.ID_YES:
-                mode = getattr(self, "mode", "direct")
-                run_busy(self, "Publishing your version...", publish.resolve, self.cfg, "mine", mode != "pr")
+            mode = getattr(self, "mode", "direct")
+            backup, ahead = run_busy(self, "Publishing your version..." if keep == "mine" else
+                                     "Taking the team's version...", publish.resolve, self.cfg, keep, mode != "pr")
+            if backup:
+                info(self, "Took the team's version of the part(s) above. Your version was saved in:\n"
+                           f"{backup}", "Team's version kept")
+            if ahead:  # something of yours is (still) there to publish
                 url = None
                 if mode == "pr":
                     url, _ = run_busy(self, "Sending for review...", github.open_pull_request, self.cfg,
                                       self.token, self.msg.GetValue().strip() or "Update parts",
                                       publish._pr_body(self.cfg))
                 self.done(url)
-            elif ans == wx.ID_NO:
-                backup = run_busy(self, "Taking the team's version...", publish.resolve, self.cfg, "theirs")
-                info(self, f"Took the team's version. Your version was saved in:\n{backup}")
         except Exception as e:  # noqa: BLE001
             error(self, e)
 
@@ -1056,7 +1073,7 @@ class LoginDialog(wx.Dialog):
     def wait(self):
         try:
             self.token = github.wait_for_login(self.start, lambda: self.cancelled)
-        except github.GitHubError as e:
+        except Exception as e:  # noqa: BLE001 - whatever it is, end the dialog instead of waiting forever
             self.err = e
         if not self.cancelled:
             wx.CallAfter(self.EndModal, wx.ID_OK if self.token else wx.ID_ABORT)

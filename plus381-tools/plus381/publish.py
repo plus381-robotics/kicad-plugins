@@ -8,9 +8,10 @@ from datetime import datetime
 from pathlib import Path
 
 from . import partsync
-from .partsync import BRANCH, Conflict, GitError, Lock, app_dir, git
+from .partsync import BRANCH, GitError, Lock, app_dir, git
 
 KINDS = {".kicad_sym": "symbol", ".kicad_mod": "footprint"}
+CHECK_TIMEOUT = 120  # seconds for the library's own check script
 
 
 def describe(path):
@@ -39,13 +40,11 @@ def pending_changes(cfg):
     if ahead:
         in_review = partsync.load_config().get("publish_mode") == "pr"
         note = ", waiting for review (pull request)" if in_review else ", not uploaded yet"
-        out = git(cfg, "diff", "--name-status", f"origin/{BRANCH}", "HEAD").stdout
-        for line in out.splitlines():
-            st, _, path = line.partition("\t")
-            path = path.split("\t")[-1]
+        # Only what the local commits changed, not what the team changed meanwhile.
+        for st, path in partsync.my_files(cfg):
             if not any(i[3] == path for i in items):
                 name, kind = describe(path)
-                items.append((name, kind, STATUS_WORDS.get(st[:1], "changed") + note, path))
+                items.append((name, kind, STATUS_WORDS.get(st, "changed") + note, path))
     return items
 
 
@@ -76,8 +75,13 @@ def run_check(cfg):
     script = Path(cfg["parts_dir"]) / "scripts" / "check_library.py"
     if not script.exists():
         return True, ""
-    r = subprocess.run([partsync.base_python(), str(script)], capture_output=True, text=True,
-                       **partsync._hidden())
+    try:
+        r = subprocess.run([partsync.base_python(), str(script)], capture_output=True, text=True,
+                           timeout=CHECK_TIMEOUT, **partsync._hidden())
+    except subprocess.TimeoutExpired:
+        return False, f"The library check took longer than {CHECK_TIMEOUT} seconds and was stopped."
+    except OSError as e:
+        return False, f"The library check could not be started: {e}"
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
@@ -93,8 +97,8 @@ def publish(cfg, message, token=None, mode="direct"):
             git(cfg, "add", "-A")
             git(cfg, "commit", "--quiet", "-m", message)
         if mode == "pr":
-            _rebase_and_push(cfg, push=False)
-            url, _ = github.open_pull_request(cfg, token, message, _pr_body(cfg))
+            if _rebase_and_push(cfg, push=False):  # else: the team already has all of it
+                url, _ = github.open_pull_request(cfg, token, message, _pr_body(cfg))
         else:
             _rebase_and_push(cfg)
     partsync.run_sync(cfg, quiet=True)
@@ -103,47 +107,43 @@ def publish(cfg, message, token=None, mode="direct"):
 
 def _pr_body(cfg):
     lines = ["Parts published from KiCad with Plus381 Tools.", ""]
-    out = git(cfg, "diff", "--name-status", f"origin/{BRANCH}", "HEAD").stdout
-    for line in out.splitlines():
-        st, _, path = line.partition("\t")
-        name, kind = describe(path.split("\t")[-1])
-        lines.append(f"- {STATUS_WORDS.get(st[:1], 'changed')} {kind}: `{name}`")
-    lines += ["", "Check the 3D model and pins, then merge. Everyone gets the part within a minute."]
+    for st, path in partsync.my_files(cfg):
+        name, kind = describe(path)
+        lines.append(f"- {STATUS_WORDS.get(st, 'changed')} {kind}: `{name}`")
+    lines += ["", "Check the 3D model and pins, then merge. Teammates then see a red dot on Library status "
+                  "and get the part with Update library."]
     return "\n".join(lines)
 
 
-def _rebase_and_push(cfg, strategy=None, push=True):
+def _rebase_and_push(cfg, keep=None, push=True):
+    """Returns how many local commits the team doesn't have (before pushing)."""
     git(cfg, "fetch", "--quiet", "origin", BRANCH)
-    ahead, behind = partsync.ahead_behind(cfg)
-    if behind:
-        args = ["rebase", "--quiet"] + (["-X", strategy] if strategy else []) + [f"origin/{BRANCH}"]
-        r = git(cfg, *args, check=False)
-        if r.returncode != 0:
-            files = [l[3:] for l in git(cfg, "status", "--porcelain").stdout.splitlines()
-                     if l[:2] in ("UU", "AA", "DU", "UD")]
-            git(cfg, "rebase", "--abort", check=False)
-            raise Conflict(files or ["(unknown)"])
-    if push and partsync.ahead_behind(cfg)[0]:
+    partsync.rebase_on_team(cfg, keep)
+    ahead = partsync.ahead_behind(cfg)[0]
+    if push and ahead:
         git(cfg, "push", "--quiet", "origin", f"HEAD:{BRANCH}")
+    return ahead
 
 
 def resolve(cfg, keep, push=True):
-    """After a Conflict: keep='mine' overwrites the other version with yours,
-    keep='theirs' takes the team version and saves yours in a backup folder."""
+    """After a Conflict, for the parts both sides changed: keep='mine' puts
+    your version over the team's, keep='theirs' takes the team's version and
+    saves yours in a backup folder. Your other unpublished parts are kept
+    and published either way (push=False: left for a pull request).
+    Returns (backup folder or None, number of commits published / to send)."""
+    backup = None
     with Lock():
-        if keep == "mine":
-            # During a rebase, "theirs" means the commits being replayed: yours.
-            _rebase_and_push(cfg, strategy="theirs", push=push)
-            return None
-        backup = app_dir() / "backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
-        out = git(cfg, "diff", "--name-only", f"origin/{BRANCH}", "HEAD").stdout.split()
-        for path in out:
-            src = Path(cfg["parts_dir"]) / path
-            if src.is_file():
-                (backup / path).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(src, backup / path)
-        git(cfg, "reset", "--hard", "--quiet", f"origin/{BRANCH}")
-        return backup
+        if keep != "mine":
+            backup = app_dir() / "backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup.mkdir(parents=True, exist_ok=True)
+            for _, path in partsync.my_files(cfg):
+                src = Path(cfg["parts_dir"]) / path
+                if src.is_file():
+                    (backup / path).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, backup / path)
+        ahead = _rebase_and_push(cfg, keep="mine" if keep == "mine" else "theirs", push=push)
+    partsync.run_sync(cfg, quiet=True, push=False)
+    return backup, ahead
 
 
 def open_folder(path):

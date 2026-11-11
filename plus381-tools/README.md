@@ -71,7 +71,8 @@ buttons to have run once first (KiCad installs the LCSC converter for them).
 | See what's going on | **Library status**: new parts waiting, update, unpublished changes, library check, re-run setup, checking on/off. |
 
 If someone else changed the same part at the same time, the plugin asks
-whose version to keep and backs up the other one.
+whose version of that part to keep (taking theirs saves yours in a backup
+folder). Your other new or changed parts are published either way.
 
 ## Logging in (only for publishing)
 
@@ -131,6 +132,11 @@ a new, empty library folder.
 * **Update library** fast-forwards to the team's version. It never
   overwrites files you are editing. Publishing also brings in the team's
   newest version (your changes go on top of it).
+* The GitHub login is only ever sent to github.com, also when the library
+  repository is somewhere else.
+* **Publish** and **Check library** run the library's own
+  `scripts/check_library.py` on your computer. Review changes to `scripts/`
+  in the library repository as carefully as changes to this plugin.
 * **Import** converts the vendor files to the current KiCad format with
   `kicad-cli`. It stores the symbol and footprint as one file each (so two
   people adding parts never conflict) and links symbol → footprint → 3D
@@ -171,7 +177,11 @@ plus381-tools/
   plus381/github.py      in-plugin GitHub login (device flow), fork + pull request
   plus381/ui.py          wxPython windows
 pcm/build.py             builds the PCM repository into dist/
+tests/                   tests (standard library only; need Git, not KiCad)
 ```
+
+* Run the tests: `python3 -m unittest discover -s tests`. They also run for
+  every pull request and before each release.
 
 * Try changes without packaging: copy `plus381-tools/` to
   `Documents/KiCad/10.0/plugins/` (Linux: `~/.local/share/kicad/10.0/plugins/`)
@@ -181,7 +191,8 @@ pcm/build.py             builds the PCM repository into dist/
 * **Release:** bump `__version__` in `plus381-tools/plus381/__init__.py` and
   push to `main`. The *Publish KiCad PCM repository* workflow rebuilds the
   GitHub Pages site, and KiCad offers the update in the Plugin and Content
-  Manager.
+  Manager. The workflow fails if the plugin's files changed but the version
+  number is still the published one.
 * One-time repo setting: **Settings → Pages → Source: GitHub Actions**.
 
 ### GitHub login (OAuth App), one-time setup by an org owner

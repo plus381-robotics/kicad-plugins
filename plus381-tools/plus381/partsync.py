@@ -64,8 +64,34 @@ def load_config():
         return {}
 
 
+def write_atomic(path, text):
+    """Write a file so that readers (the background check, the other Plus381
+    windows, KiCad) only ever see the old or the new content, never half of
+    it, and a crash can't leave it cut off."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows: someone is reading it right now
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def save_config(cfg):
-    config_path().write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    write_atomic(config_path(), json.dumps(cfg, indent=2))
 
 
 def load_status():
@@ -88,7 +114,7 @@ def save_status(st):
 
 
 def _write_status(st):
-    status_path().write_text(json.dumps(st, indent=2), encoding="utf-8")
+    write_atomic(status_path(), json.dumps(st, indent=2))
 
 
 def default_parts_dir():
@@ -260,32 +286,63 @@ def delete_token():
         pass
 
 
+# Where the GitHub login may be sent (PLUS381_GITHUB_WEB: tests with a fake server).
+GITHUB_WEB = os.environ.get("PLUS381_GITHUB_WEB", "https://github.com").rstrip("/")
+
+
 def _auth_env(cfg):
     """Git settings (passed in the environment, never on the command line or
-    in a config file) that send the saved login to GitHub for this command."""
+    in a config file) that send the saved login to GitHub for this command.
+    Only to GitHub: a library repository on another server never gets it."""
     token = load_token()
     if not token:
         return {}
     import base64
-    from urllib.parse import urlparse
-    url = urlparse(repo_url(cfg))
-    scheme, host = (url.scheme, url.netloc) if url.netloc else ("https", "github.com")
     login = cfg.get("github_login") or "x-access-token"
     basic = base64.b64encode(f"{login}:{token}".encode()).decode()
     n = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
-    return {"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": f"http.{scheme}://{host}/.extraheader",
+    return {"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": f"http.{GITHUB_WEB}/.extraheader",
             f"GIT_CONFIG_VALUE_{n}": f"AUTHORIZATION: basic {basic}"}
 
 
-def git(cfg, *args, check=True, timeout=600):
-    exe = cfg.get("git") or find_git()
+def git_exe(cfg):
+    """The Git to use: the one remembered by Setup while it still exists
+    (GitHub Desktop moves its Git with every update), else a fresh search."""
+    exe = cfg.get("git")
+    if exe and os.path.isfile(exe):
+        return exe
+    exe = find_git()
     if not exe:
         raise GitError("Git is not installed. Install Git for Windows / GitHub Desktop "
                        "(Windows) or git + git-lfs (macOS/Linux).")
+    return exe
+
+
+_AUTH_FAILED = re.compile(r"authentication failed|invalid username or password|bad credentials|"
+                          r"returned error: 40[13]", re.I)
+
+
+def git(cfg, *args, check=True, timeout=600):
+    exe = git_exe(cfg)
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="auto")
-    env.update(_auth_env(cfg))
-    r = subprocess.run([exe, "-C", cfg["parts_dir"], *args], capture_output=True, text=True,
-                       env=env, timeout=timeout, **_hidden())
+    auth = _auth_env(cfg)
+    # core.quotepath: file names with non-ASCII letters are printed as they are.
+    cmd = [exe, "-C", cfg["parts_dir"], "-c", "core.quotepath=false", *args]
+    name = next((a for a in args if not a.startswith("-") and "=" not in a), args[0])  # "fetch", "push", ...
+
+    def run(extra):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  env=dict(env, **extra), timeout=timeout, **_hidden())
+        except subprocess.TimeoutExpired:
+            raise GitError(f"git {name} took longer than {timeout} seconds and was stopped. "
+                           "Check your internet connection.")
+
+    r = run(auth)
+    if r.returncode != 0 and auth and name != "push" and _AUTH_FAILED.search(r.stderr or ""):
+        # The saved GitHub login was revoked: reading a public library
+        # doesn't need one, so don't let it block getting new parts.
+        r = run({})
     if check and r.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed:\n{(r.stderr or r.stdout).strip()}")
     return r
@@ -403,7 +460,7 @@ def ensure_lib_tables(parts_dir):
             close = new.rstrip().rfind(")")
             new = new[:close].rstrip("\n ") + "\n" + add + new[close:]
             if new != text:
-                path.write_text(new, encoding="utf-8")
+                write_atomic(path, new)
     return problems
 
 
@@ -459,18 +516,28 @@ def ensure_env_var(parts_dir):
     dirs = kicad_config_dirs()
     if not dirs:
         return "KiCad 10 settings not found: start KiCad once and finish its welcome wizard."
+    problems = []
     for cfgdir in dirs:
         path = cfgdir / "kicad_common.json"
         try:
             d = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            if not isinstance(d, dict):
+                raise ValueError("not a JSON object")
+        except FileNotFoundError:
             d = {}
-        d.setdefault("environment", {})
+        except (OSError, ValueError) as e:
+            # Never replace settings that can't be read: that would reset
+            # all of KiCad's common settings.
+            problems.append(f"{path} could not be read ({e}), so the path variable {VAR} was not saved there. "
+                            f"Set it by hand in Preferences > Configure Paths: {want}")
+            continue
+        if not isinstance(d.get("environment"), dict):
+            d["environment"] = {}
         if not isinstance(d["environment"].get("vars"), dict):
             d["environment"]["vars"] = {}
         d["environment"]["vars"][VAR] = want
-        path.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    return "ok"
+        write_atomic(path, json.dumps(d, indent=2))
+    return "\n".join(problems) or "ok"
 
 
 def configure_kicad(parts_dir):
@@ -482,36 +549,77 @@ def configure_kicad(parts_dir):
 # Sync
 # --------------------------------------------------------------------------
 
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    if IS_WIN:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return k.GetLastError() == 5  # access denied: it exists, as another user
+        try:
+            code = ctypes.c_ulong()
+            return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class Lock:
-    """Stops the background sync and the plugin from running git at the same time."""
+    """Stops the background check and the plugin from running git at the same time."""
+
+    STALE = 2 * 3600  # seconds after which a lock is given up whatever it says
 
     def __init__(self, wait=60):
         self.path = app_dir() / "sync.lock"
         self.wait = wait
-        self.fd = None
+        self.mine = f"{os.getpid()}.{time.time_ns()}"
+
+    def _stale(self):
+        """Left behind by a run that crashed or was closed with KiCad?"""
+        try:
+            age = time.time() - self.path.stat().st_mtime
+            owner = self.path.read_text().strip()
+        except OSError:
+            return False  # just released, or being written
+        try:
+            pid = int(owner.split(".")[0])
+        except ValueError:
+            return age > 30  # empty: its owner died between creating and writing it
+        return age > self.STALE or not _pid_alive(pid)
 
     def __enter__(self):
         deadline = time.time() + self.wait
         while True:
             try:
-                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self.fd, str(os.getpid()).encode())
-                return self
-            except FileExistsError:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 try:
-                    if time.time() - self.path.stat().st_mtime > 600:
-                        self.path.unlink()  # stale lock from a crashed run
-                        continue
-                except OSError:
+                    os.write(fd, self.mine.encode())
+                finally:
+                    os.close(fd)
+                return self
+            except (FileExistsError, PermissionError):  # PermissionError: Windows, while it is being deleted
+                if self._stale():
+                    try:
+                        self.path.unlink()
+                    except OSError:
+                        pass
                     continue
                 if time.time() > deadline:
                     raise GitError("Another sync is still running, try again in a minute.")
-                time.sleep(1)
+                time.sleep(0.5)
 
     def __exit__(self, *exc):
-        os.close(self.fd)
         try:
-            self.path.unlink()
+            if self.path.read_text().strip() == self.mine:  # not someone else's newer lock
+                self.path.unlink()
         except OSError:
             pass
 
@@ -522,13 +630,31 @@ def is_repo(cfg):
 
 def changed_files(cfg):
     """Local changes not yet committed: list of (status, path)."""
-    out = git(cfg, "status", "--porcelain", "-uall").stdout
+    # -z: paths exactly as they are (spaces, any letters), separated by NUL.
+    fields = git(cfg, "status", "--porcelain", "-z", "-uall").stdout.split("\0")
     files = []
-    for line in out.splitlines():
-        if len(line) > 3:
-            path = line[3:].split(" -> ")[-1].strip('"')
-            files.append((line[:2].strip(), path))
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) > 3:
+            files.append((entry[:2].strip(), entry[3:]))
+            if entry[0] in "RC":
+                i += 1  # a rename or copy is followed by the old path
     return files
+
+
+def diff_files(cfg, *revs):
+    """Files that differ between revisions (git diff): list of (status
+    letter, path). A moved file is listed as deleted and added."""
+    fields = git(cfg, "diff", "--name-status", "--no-renames", "-z", *revs).stdout.split("\0")
+    return [(fields[i][:1], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
+
+
+def my_files(cfg):
+    """Files changed by local commits the team doesn't have yet (not what
+    the team changed meanwhile): list of (status letter, path)."""
+    return diff_files(cfg, f"origin/{BRANCH}...HEAD")
 
 
 def ahead_behind(cfg):
@@ -540,6 +666,62 @@ class Conflict(GitError):
     def __init__(self, files):
         super().__init__("Someone else changed the same files: " + ", ".join(files))
         self.files = files
+
+
+def _rebasing(cfg):
+    out = git(cfg, "rev-parse", "--git-path", "rebase-merge", "--git-path", "rebase-apply").stdout.split("\n")
+    return any(p and (Path(cfg["parts_dir"]) / p).exists() for p in out)
+
+
+def _unmerged(cfg):
+    return [f for f in git(cfg, "diff", "--name-only", "--diff-filter=U", "-z").stdout.split("\0") if f]
+
+
+def rebase_on_team(cfg, keep=None):
+    """Put the local commits on top of the team's newest version
+    (origin/main must be fetched). Call with the Lock held.
+
+    keep=None: stop at the first file both sides changed, leave everything
+    as it was and raise Conflict. keep="mine" / "theirs": for every such
+    file take that side's whole version (a part is one file: mixing two
+    edits of it line by line could break it). A file one side deleted is
+    handled the same way."""
+    if not ahead_behind(cfg)[1]:
+        return
+    mine = {path for _, path in my_files(cfg)}
+    if not mine & {path for _, path in diff_files(cfg, "HEAD", f"origin/{BRANCH}")}:
+        # Everything in the local commits is already in the team's version
+        # (e.g. a pull request merged as one squashed commit): drop them
+        # instead of replaying them, which would only produce conflicts.
+        git(cfg, "reset", "--keep", "--quiet", f"origin/{BRANCH}")
+        return
+    r = git(cfg, "-c", "core.editor=true", "rebase", "--quiet", f"origin/{BRANCH}", check=False)
+    for _ in range(10000):
+        if not _rebasing(cfg):
+            if r.returncode != 0:
+                raise GitError("Could not combine your changes with the team's:\n" + (r.stderr or r.stdout).strip())
+            return
+        files = _unmerged(cfg)
+        if keep is None or not files:
+            git(cfg, "rebase", "--abort", check=False)
+            if files:
+                raise Conflict(files)
+            raise GitError("Could not combine your changes with the team's:\n" + (r.stderr or r.stdout).strip())
+        # While rebasing, git calls the team's version "ours" (stage 2) and
+        # the local commit being replayed "theirs" (stage 3).
+        stage, side = ("3", "--theirs") if keep == "mine" else ("2", "--ours")
+        for f in files:
+            if git(cfg, "cat-file", "-e", f":{stage}:{f}", check=False).returncode == 0:
+                git(cfg, "checkout", side, "--", f)
+                git(cfg, "add", "--", f)
+            else:  # that side deleted the file
+                git(cfg, "rm", "--quiet", "--force", "--", f)
+        r = git(cfg, "-c", "core.editor=true", "rebase", "--continue", check=False)
+        if r.returncode != 0 and _rebasing(cfg) and not _unmerged(cfg):
+            # Nothing left of this commit after taking the other side.
+            r = git(cfg, "-c", "core.editor=true", "rebase", "--skip", check=False)
+    git(cfg, "rebase", "--abort", check=False)
+    raise GitError("Could not combine your changes with the team's.")
 
 
 def sync(cfg, push=True):
@@ -560,12 +742,11 @@ def sync(cfg, push=True):
             if dirty:
                 st.update(ok=False, message="Waiting: you have unpublished changes. Publish them to sync.")
             else:
-                r = git(cfg, "rebase", "--quiet", f"origin/{BRANCH}", check=False)
-                if r.returncode != 0:
-                    files = [l[3:] for l in git(cfg, "status", "--porcelain").stdout.splitlines()
-                             if l[:2] in ("UU", "AA", "DU", "UD")]
-                    git(cfg, "rebase", "--abort", check=False)
-                    raise Conflict(files)
+                try:
+                    rebase_on_team(cfg)
+                except Conflict as c:
+                    raise GitError("The team changed part(s) that you changed too and haven't published yet: "
+                                   + ", ".join(c.files) + ".\nClick Publish to choose which version to keep.")
         ahead, behind = ahead_behind(cfg)
         # People without write access publish through pull requests: their
         # commits wait locally until the pull request is merged.
@@ -574,7 +755,7 @@ def sync(cfg, push=True):
             git(cfg, "push", "--quiet", "origin", f"HEAD:{BRANCH}")
         after = git(cfg, "rev-parse", "HEAD").stdout.strip()
         if after != before:
-            st["new_files"] = git(cfg, "diff", "--name-only", before, after).stdout.split()
+            st["new_files"] = [path for _, path in diff_files(cfg, before, after)]
         problems, env = configure_kicad(cfg["parts_dir"])
         st["kicad_problems"] = problems
         st["env_var"] = env
@@ -588,11 +769,14 @@ def check_updates(cfg):
     anything locally (git fetch only). Returns the number of changed files
     and the names of the changed parts."""
     with Lock():
-        git(cfg, "fetch", "--quiet", "origin", BRANCH)
+        # A short time limit: this runs in the background holding the lock,
+        # and a dead connection must not block Publish/Update for minutes.
+        git(cfg, "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30",
+            "fetch", "--quiet", "origin", BRANCH, timeout=120)
         _, behind = ahead_behind(cfg)
         names = []
         if behind:
-            out = git(cfg, "diff", "--name-only", f"HEAD...origin/{BRANCH}").stdout.split()
+            out = [path for _, path in diff_files(cfg, f"HEAD...origin/{BRANCH}")]
             for path in out:
                 name, ext = os.path.splitext(os.path.basename(path))
                 if ext in (".kicad_sym", ".kicad_mod") and name not in names:
@@ -622,6 +806,12 @@ def run_sync(cfg, quiet=False, push=True):
     except Exception as e:  # noqa: BLE001 - report instead of crashing
         st = {"ok": False, "message": str(e)}
     old = load_status()
+    if st.get("ok"):  # a sync looks at GitHub too
+        st.update(checked=datetime.now().isoformat(timespec="seconds"), check_error="")
+    else:
+        for k in ("checked", "check_error"):
+            if k in old:
+                st.setdefault(k, old[k])
     if st.get("new_files"):
         st["last_update"] = datetime.now().isoformat(timespec="seconds")
         st["last_new_files"] = st["new_files"]
@@ -640,6 +830,7 @@ def run_sync(cfg, quiet=False, push=True):
 
 CHECK_EVERY = 120   # seconds between looks at GitHub while KiCad is open
 KICAD_EVERY = 15    # seconds between "is KiCad still open?" checks
+KICAD_PENDING_EVERY = 3   # ... while KiCad's settings wait to be written (it must be closed for that)
 
 
 def start_watcher():
@@ -686,11 +877,19 @@ def watch():
     lock = _only_watcher()
     if not lock:
         return 0
+    try:
+        return _watch(lock)
+    finally:
+        lock.close()
+
+
+def _watch(lock):
     remove_old_scheduler()
     me = os.path.abspath(__file__)
     code = Path(me).read_bytes()
     last = 0.0
     closed = 0
+    started = time.time()
     while True:
         try:
             changed = Path(me).read_bytes() != code
@@ -700,18 +899,25 @@ def watch():
             lock.close()
             os.execv(sys.executable, [sys.executable, me, "watch"])
         cfg = load_config()
+        repo = is_repo(cfg)
         if kicad_running():
             closed = 0
-            if cfg.get("check_updates", True) and is_repo(cfg) and time.time() - last >= CHECK_EVERY:
+            if cfg.get("check_updates", True) and repo and time.time() - last >= CHECK_EVERY:
                 run_check(cfg)
                 last = time.time()
         else:
             closed += 1
-            if closed >= 2:  # seen closed twice: not just restarting
-                if is_repo(cfg):
+            if repo:
+                try:  # right away: the user may reopen KiCad within seconds
                     configure_kicad(cfg["parts_dir"])
+                except Exception:  # noqa: BLE001 - tried again next time
+                    pass
+            if closed >= 2:  # seen closed twice: not just restarting
                 return 0
-        time.sleep(KICAD_EVERY)
+        # Settings still to be written (right after Setup): look often for a
+        # while, so a quick "close KiCad and open it again" is not missed.
+        waiting = repo and closed == 0 and time.time() - started < 900 and not env_var_ok(cfg["parts_dir"])
+        time.sleep(KICAD_PENDING_EVERY if waiting else KICAD_EVERY)
 
 
 def remove_old_scheduler():

@@ -161,11 +161,18 @@ def find_kicad_cli():
     return None
 
 
+CLI_TIMEOUT = 180  # seconds for one kicad-cli run (a big STEP model takes a while)
+
+
 def kicad_cli(*args):
     exe = find_kicad_cli()
     if not exe:
         return False
-    r = subprocess.run([exe, *[str(a) for a in args]], capture_output=True, text=True, **_hidden())
+    try:
+        r = subprocess.run([exe, *[str(a) for a in args]], capture_output=True, text=True, timeout=CLI_TIMEOUT,
+                           **_hidden())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     return r.returncode == 0
 
 
@@ -214,6 +221,14 @@ def _norm(s):
 def analyze(source):
     source = Path(source)
     tmp = Path(tempfile.mkdtemp(prefix="plus381-"))
+    try:
+        return _analyze(source, tmp)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)  # don't leave the unpacked download behind
+        raise
+
+
+def _analyze(source, tmp):
     dl = Download(source, tmp)
     root = tmp / "in"
     if source.is_dir():
@@ -351,10 +366,24 @@ def fp_file(parts_dir, category, name):
     return Path(parts_dir) / "footprints" / f"{lib_prefix(parts_dir)}{category}.pretty" / f"{name}.kicad_mod"
 
 
+def existing_files(parts_dir, kind, name):
+    """Files of symbols/footprints that already have this name, in any
+    category. Upper/lower case is ignored: "LM358" and "lm358" would be one
+    file for teammates on Windows and macOS."""
+    folders, ext = ("symbols/*.kicad_symdir", ".kicad_sym") if kind == "sym" else ("footprints/*.pretty", ".kicad_mod")
+    want = (name + ext).lower()
+    found = []
+    for d in sorted(Path(parts_dir).glob(folders)):
+        try:
+            found += [p for p in sorted(d.iterdir()) if p.name.lower() == want]
+        except OSError:
+            pass
+    return found
+
+
 def find_existing(parts_dir, kind, name):
-    """Library nicknames that already hold a symbol/footprint with this name."""
-    pattern = f"symbols/*.kicad_symdir/{name}.kicad_sym" if kind == "sym" else f"footprints/*.pretty/{name}.kicad_mod"
-    return [p.parent.stem for p in Path(parts_dir).glob(pattern)]
+    """"Library:Name" of the symbols/footprints that already have this name."""
+    return [f"{p.parent.stem}:{p.stem}" for p in existing_files(parts_dir, kind, name)]
 
 
 def find_same_model(parts_dir, model):
@@ -451,30 +480,60 @@ def check_choices(parts_dir, c):
         errors.append("Footprint name is empty.")
     if not c.replace:
         if c.symbol:
-            for lib in find_existing(parts_dir, "sym", c.symbol_name):
-                errors.append(f"Symbol {lib}:{c.symbol_name} already exists (tick 'Replace existing').")
+            for part in find_existing(parts_dir, "sym", c.symbol_name):
+                errors.append(f"Symbol {part} already exists (tick 'Replace existing').")
         if c.footprint:
-            for lib in find_existing(parts_dir, "fp", c.footprint_name):
-                errors.append(f"Footprint {lib}:{c.footprint_name} already exists (tick 'Replace existing').")
+            for part in find_existing(parts_dir, "fp", c.footprint_name):
+                errors.append(f"Footprint {part} already exists (tick 'Replace existing').")
     return errors
 
 
 def do_import(parts_dir, c):
-    """Write the part. Returns a list of (what, path) that were written."""
+    """Write the part. Returns a list of (what, path) that were written.
+    All or nothing: if a step fails, the files written or removed so far
+    are put back as they were."""
+    undo = []  # (path, content before or None if it didn't exist)
+    try:
+        return _do_import(parts_dir, c, undo)
+    except BaseException:
+        for path, old in reversed(undo):
+            try:
+                if old is None:
+                    path.unlink()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(old)
+            except OSError:
+                pass
+        raise
+
+
+def _do_import(parts_dir, c, undo):
+    def remember(path):
+        undo.append((path, path.read_bytes() if path.exists() else None))
+
     written = []
     nick = lib_prefix(parts_dir) + c.category
     fp_ref = ""
     if c.footprint:
-        model_name = install_model(parts_dir, c.model, c.footprint_name) if c.model else None
-        if model_name:
-            written.append(("3D model", Path(parts_dir) / "3dmodels" / model_name))
-        # A replaced part may live in another category: remove the old copy.
-        if c.replace:
-            for lib in find_existing(parts_dir, "fp", c.footprint_name):
-                if lib != nick:
-                    (Path(parts_dir) / "footprints" / f"{lib}.pretty" / f"{c.footprint_name}.kicad_mod").unlink()
+        model_name = None
+        if c.model:
+            models = Path(parts_dir) / "3dmodels"
+            had = {p.name for p in models.iterdir()} if models.is_dir() else set()
+            model_name = install_model(parts_dir, c.model, c.footprint_name)
+            if model_name not in had:  # a new file, not a reused identical model
+                undo.append((models / model_name, None))
+            written.append(("3D model", models / model_name))
         dest = fp_file(parts_dir, c.category, c.footprint_name)
+        # A replaced part may live in another category (or have a name that
+        # differs only in upper/lower case): remove the old copy.
+        if c.replace:
+            for old in existing_files(parts_dir, "fp", c.footprint_name):
+                if old != dest:
+                    remember(old)
+                    old.unlink()
         dest.parent.mkdir(parents=True, exist_ok=True)
+        remember(dest)
         dest.write_text(build_footprint(c.footprint, c.footprint_name, model_name, c.offset, c.rotation),
                         encoding="utf-8")
         _normalise_footprint(dest)
@@ -483,21 +542,18 @@ def do_import(parts_dir, c):
     elif c.symbol:
         fp_ref = get_prop(c.symbol.block, "Footprint") or ""
     if c.symbol:
-        if c.replace:
-            for lib in find_existing(parts_dir, "sym", c.symbol_name):
-                if lib != nick:
-                    (Path(parts_dir) / "symbols" / f"{lib}.kicad_symdir" / f"{c.symbol_name}.kicad_sym").unlink()
         dest = sym_file(parts_dir, c.category, c.symbol_name)
+        if c.replace:
+            for old in existing_files(parts_dir, "sym", c.symbol_name):
+                if old != dest:
+                    remember(old)
+                    old.unlink()
         dest.parent.mkdir(parents=True, exist_ok=True)
-        backup = dest.read_text(encoding="utf-8") if dest.exists() else None
+        remember(dest)
         dest.write_text(build_symbol(c.symbol, c.symbol_name, fp_ref, c.mpn, c.manufacturer, c.datasheet),
                         encoding="utf-8")
         if find_kicad_cli() and not kicad_cli("sym", "upgrade", "--force", dest):
-            if backup is None:
-                dest.unlink()
-            else:
-                dest.write_text(backup, encoding="utf-8")
-            raise RuntimeError("KiCad could not read the converted symbol; nothing was saved for it.")
+            raise RuntimeError("KiCad could not read the converted symbol, so nothing was imported.")
         written.append(("symbol", dest))
     return written
 
@@ -723,9 +779,13 @@ def render_preview(fp, model, offset, rotation, outdir, size=(260, 200), views=N
         if png.exists():
             png.unlink()
         source = boards["side" if name in ("Front", "Right") else "3d" if name == "3D" else "top"]
-        r = subprocess.run([cli, "pcb", "render", str(source), "-o", str(png), "-w", str(size[0]),
-                            "-h", str(size[1]), "--background", "opaque", "--zoom", "0.9",
-                            *PREVIEW_VIEWS[name]], capture_output=True, text=True, env=env, **_hidden())
+        try:
+            r = subprocess.run([cli, "pcb", "render", str(source), "-o", str(png), "-w", str(size[0]),
+                                "-h", str(size[1]), "--background", "opaque", "--zoom", "0.9",
+                                *PREVIEW_VIEWS[name]], capture_output=True, text=True, env=env,
+                               timeout=CLI_TIMEOUT, **_hidden())
+        except (OSError, subprocess.TimeoutExpired):
+            return  # this view stays empty
         if r.returncode == 0 and png.exists():
             results[name] = png
             if on_view:

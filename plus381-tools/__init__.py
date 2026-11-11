@@ -32,8 +32,13 @@ ACTIONS = (("import", "Import part"), ("publish", "Publish changes"), ("status",
 
 def _editor_window():
     import wx
-    for w in wx.GetTopLevelWindows():
-        if w.IsShown() and "PCB Editor" in w.GetTitle():
+    shown = [w for w in wx.GetTopLevelWindows() if w.IsShown()]
+    # By KiCad's internal window name first: the title is translated.
+    for w in shown:
+        if w.GetName() == "PcbFrame":
+            return w
+    for w in shown:
+        if "PCB Editor" in w.GetTitle():
             return w
     return None
 
