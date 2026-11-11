@@ -263,20 +263,41 @@ def save_token(token):
     if IS_WIN:
         data = _dpapi(data, True)
     tmp = path.with_suffix(".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
+    # Find out now, with a clear message, rather than at the next start.
+    saved, _, detail = token_state()
+    if saved != token.strip():
+        raise OSError("The GitHub login could not be saved on this computer"
+                      + (f" ({detail})" if detail else "") + ".")
+
+
+def token_state():
+    """(token, state, detail) of the login saved on this computer. state:
+    "ok", "none" (never logged in, or logged out) or "unreadable" (the file
+    is there but can't be used; detail says why)."""
+    path = _token_path()
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None, "none", ""
+    except OSError as e:
+        return None, "unreadable", f"{path}: {e}"
+    try:
+        if IS_WIN:
+            data = _dpapi(data, False)
+        token = data.decode().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        return None, "unreadable", f"{path}: {e}"
+    if not token:
+        return None, "unreadable", f"{path} is empty"
+    return token, "ok", ""
 
 
 def load_token():
-    try:
-        data = _token_path().read_bytes()
-        if IS_WIN:
-            data = _dpapi(data, False)
-        return data.decode().strip() or None
-    except (OSError, UnicodeDecodeError):
-        return None
+    return token_state()[0]
 
 
 def delete_token():
@@ -303,6 +324,19 @@ def _auth_env(cfg):
     n = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
     return {"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": f"http.{GITHUB_WEB}/.extraheader",
             f"GIT_CONFIG_VALUE_{n}": f"AUTHORIZATION: basic {basic}"}
+
+
+MIN_GIT = (2, 31)  # the first Git that can be handed the login through its environment
+
+
+def git_version(exe):
+    """(major, minor) of a Git program, or None if it can't be asked."""
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30, **_hidden()).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"(\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def git_exe(cfg):

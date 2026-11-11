@@ -90,6 +90,14 @@ plugin's own commands, so other tools (GitHub Desktop, VS Code, Git
 Credential Manager) can't replace or remove it. **Library status** shows who
 is logged in and has **Log in to GitHub** / **Log out** buttons.
 
+The plugin asks you to log in again only when the saved login is really
+gone: you logged out, the file can't be read any more (another Windows
+account, a reinstalled Windows), or GitHub itself rejects it (you revoked it
+under *Settings → Applications → Authorized OAuth Apps*, or logged in more
+than ten times, after which GitHub drops the oldest login). Being offline or
+a GitHub error never counts as logged out. Whenever it does ask, the
+question says why, and the reason is written to `plugin.log`.
+
 * **Members of plus381-robotics** publish straight into the team library.
 * **Anyone else** (alumni, other teams) can publish too: the plugin creates
   their own copy (fork) of `kicad-parts` and opens a **pull request**. A member

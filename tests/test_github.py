@@ -82,6 +82,112 @@ class Login(Case):
         self.assertEqual(partsync.load_config()["publish_mode"], "direct")
 
 
+class SavedLogin(Case):
+    """Once logged in, a new login is only asked for when the saved one is
+    really gone or GitHub itself rejects it."""
+
+    def setUp(self):
+        super().setUp()
+        partsync.save_config({"parts_dir": str(self.tmp), "github_login": "someone", "publish_mode": "pr"})
+        self.calls = []
+
+    def github(self, repo=None, user=None):
+        """What GitHub answers: a dict, or an exception to raise."""
+        def answer(what):
+            if isinstance(what, Exception):
+                raise what
+            return what
+
+        def api(method, path, token, data=None):
+            self.calls.append(path)
+            return answer(user if path == "/user" else repo)
+
+        def request(method, url, data=None, token=None, form=False):
+            self.calls.append(url)
+            a = answer(user)
+            return (a, {}) if isinstance(a, int) else (200, a)
+        self.patch(github, "api", api)
+        self.patch(github, "_request", request)
+
+    @staticmethod
+    def error(status):
+        e = github.GitHubError(f"GitHub GET /repos/x/y: {status} whatever")
+        e.status = status
+        return e
+
+    def test_token_file_round_trip(self):
+        self.assertEqual(partsync.token_state(), (None, "none", ""))
+        partsync.save_token("gho_secret")
+        self.assertEqual(partsync.token_state(), ("gho_secret", "ok", ""))
+        path = partsync._token_path()
+        if not partsync.IS_WIN:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.json", path.name])
+
+    def test_never_logged_in(self):
+        self.patch(github, "_git_cred", lambda cfg, action, fields: {})
+        self.assertEqual(github.check_login({})[:3], (None, None, "none"))
+
+    def test_login_file_that_cannot_be_read(self):
+        partsync._token_path().write_bytes(b"\xff\xfe broken")
+        token, mode, problem, detail = github.check_login({})
+        self.assertEqual((token, problem), (None, "unreadable"))
+        self.assertIn("github-token", detail)
+
+    def test_valid_login(self):
+        partsync.save_token("gho_secret")
+        self.github(repo={"permissions": {"push": True}})
+        self.assertEqual(github.check_login({}), ("gho_secret", "direct", None, ""))
+        self.assertEqual(partsync.load_config()["publish_mode"], "direct")
+
+    def test_offline_keeps_the_login(self):
+        partsync.save_token("gho_secret")
+        self.github(repo=github.NetworkError("Could not reach GitHub: offline"))
+        self.assertEqual(github.check_login({})[:3], ("gho_secret", "pr", None))
+        self.assertEqual(partsync.token_state()[1], "ok")
+
+    def test_github_errors_keep_the_login(self):
+        """Rate limits, server errors, a moved repository: not a reason to log in again."""
+        partsync.save_token("gho_secret")
+        for status in (403, 404, 500, 502):
+            self.github(repo=self.error(status))
+            self.assertEqual(github.check_login({})[:3], ("gho_secret", "pr", None), status)
+
+    def test_single_401_is_checked_again(self):
+        partsync.save_token("gho_secret")
+        self.github(repo=self.error(401), user={"login": "someone"})
+        self.assertEqual(github.check_login({})[:3], ("gho_secret", "pr", None))
+        self.github(repo=self.error(401), user=github.NetworkError("offline"))
+        self.assertEqual(github.check_login({})[:3], ("gho_secret", "pr", None))
+
+    def test_login_revoked_on_github(self):
+        partsync.save_token("gho_secret")
+        self.github(repo=self.error(401), user=401)
+        self.assertEqual(github.check_login({})[:3], (None, None, "revoked"))
+        self.assertIn("revoked", github.LOGIN_PROBLEMS["revoked"])
+
+    def test_name_lost_from_settings_is_looked_up_again(self):
+        """Lost settings must not look like "logged out" while the login is there."""
+        partsync.save_token("gho_secret")
+        partsync.save_config({"parts_dir": str(self.tmp)})
+        self.github(repo={"permissions": {"push": False}}, user={"login": "someone", "id": 1})
+        self.assertEqual(github.check_login({})[:3], ("gho_secret", "pr", None))
+        self.assertEqual(partsync.load_config()["github_login"], "someone")
+
+    def test_broken_credential_helper_is_not_an_error(self):
+        def boom(cfg, action, fields):
+            raise OSError("git is gone")
+        self.patch(github, "_git_cred", boom)
+        self.assertIsNone(github.get_token({}))
+
+    def test_logout_removes_the_login(self):
+        partsync.save_token("gho_secret")
+        self.patch(github, "_git_cred", lambda cfg, action, fields: {})
+        github.logout({})
+        self.assertEqual(partsync.token_state()[1], "none")
+        self.assertNotIn("github_login", partsync.load_config())
+
+
 class Fork(Case):
     def setUp(self):
         super().setUp()

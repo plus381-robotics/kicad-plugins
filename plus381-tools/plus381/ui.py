@@ -204,6 +204,10 @@ def do_setup(log, parts_dir, name, email, auto, repo=None):
                        "macOS: install Xcode Command Line Tools or 'brew install git git-lfs'.\n"
                        "Linux: install git and git-lfs with your package manager.")
     log(f"Git: {gitexe}")
+    version = partsync.git_version(gitexe)
+    if version and version < partsync.MIN_GIT:
+        log(f"! This Git is version {version[0]}.{version[1]}. Publishing needs "
+            f"{partsync.MIN_GIT[0]}.{partsync.MIN_GIT[1]} or newer: install the current Git.")
     hidden = partsync._hidden()
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     r = subprocess.run([gitexe, "lfs", "version"], capture_output=True, text=True, **hidden)
@@ -941,36 +945,60 @@ class PublishDialog(wx.Dialog):
         except Exception as e:  # noqa: BLE001
             hint = ""
             if re.search(r"auth|credential|permission|403|could not read username", str(e), re.I):
-                hint = ("\n\nGitHub refused the upload. Open Library status > Log in to GitHub and try again.")
+                hint = "\n\n" + self.refused_hint()
+                log_note(f"publishing was refused: {e}")
             error(self, f"Publishing failed:\n{e}{hint}\n\nYour changes are saved locally; try again later.")
         else:
             self.done(url)
         self.refresh()
 
+    def refused_hint(self):
+        """What to do when GitHub refuses an upload (not "log in again":
+        the login was checked just before)."""
+        version = partsync.git_version(partsync.git_exe(self.cfg))
+        if version and version < partsync.MIN_GIT:
+            return (f"Your Git is version {version[0]}.{version[1]}, which can't use the GitHub login "
+                    f"({partsync.MIN_GIT[0]}.{partsync.MIN_GIT[1]} or newer is needed). Install the current Git "
+                    "and run Library status > Run setup again.")
+        if not getattr(self, "token", None):
+            return "GitHub refused the upload. Open Library status > Log in to GitHub and try again."
+        return ("GitHub refused the upload although your login is valid, so logging in again won't help. "
+                "Usually your rights to the library changed: wait a minute and publish again, or ask a "
+                "team owner. plugin.log in the settings folder has the details.")
+
     def ensure_login(self):
         """(token, mode) when logged in, None when in-plugin login isn't
-        configured (fall back to whatever login Git has), False if cancelled."""
+        configured (fall back to whatever login Git has), False if cancelled.
+        Only asks to log in when there is no usable saved login (see
+        github.check_login), and says why."""
         if not github.client_id():
             return None
         try:
-            token = run_busy(self, "Checking your GitHub login...", github.get_token, self.cfg)
-            if token:
-                mode = run_busy(self, "Checking your GitHub login...", github.publish_mode, token)
-                return token, mode
-        except github.GitHubError as e:
-            if " 401 " not in str(e) + " ":
-                error(self, e, "Can't reach GitHub")
-                return False
-            # 401: the saved login was revoked or expired, so log in again
-        if wx.MessageBox("To publish, log in to GitHub once. It takes a few seconds in your browser "
-                         "and KiCad remembers it.\n\nLog in now?", TITLE, wx.YES_NO | wx.ICON_QUESTION,
-                         self) != wx.YES:
+            token, mode, problem, detail = run_busy(self, "Checking your GitHub login...",
+                                                    github.check_login, self.cfg)
+        except Exception as e:  # noqa: BLE001
+            log_error("checking the GitHub login")
+            error(self, e, "Can't check your GitHub login")
+            return False
+        if token:
+            if detail:
+                log_note(f"GitHub login kept, publish mode '{mode}' from last time: {detail}")
+            return token, mode
+        log_note(f"asking for a GitHub login: {problem} {detail}".rstrip())
+        if wx.MessageBox(github.LOGIN_PROBLEMS[problem] + "\n\nLog in now?", TITLE,
+                         wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES:
             return False
         result = login_dialog(self, self.cfg)
         if not result:
             return False
         me, mode = result
         token = github.get_token(self.cfg)
+        if not token:
+            _, _, detail = partsync.token_state()
+            log_note(f"the new GitHub login can't be read back: {detail}")
+            error(self, f"You are logged in, but the login could not be saved on this computer:\n{detail}",
+                  "Login not saved")
+            return False
         return token, mode
 
     def done(self, url):
@@ -1103,6 +1131,7 @@ def login_dialog(parent, cfg):
     how = ("You can publish straight to the team library." if mode == "direct" else
            "Your account isn't a member of plus381-robotics, so your parts will be sent as pull requests "
            "for the team to review.")
+    log_note(f"logged in to GitHub as {me['login']} ({mode})")
     info(parent, f"Logged in to GitHub as {me['login']}.\n\n{how}", "Logged in")
     return me, mode
 
@@ -1158,6 +1187,7 @@ class StatusDialog(wx.Dialog):
             f"Path variable:    {'ok' if partsync.env_var_ok(cfg['parts_dir']) else 'not set yet - close KiCad completely and open it again'}",
             f"Unpublished:      {pending} change(s)",
             f"GitHub:           {self.github_line()}",
+            f"Plugin version:   {__version__}",
         ]
         if st.get("message"):
             lines += ["", "Message: " + st["message"]]
@@ -1181,19 +1211,32 @@ class StatusDialog(wx.Dialog):
         return f"NEW PARTS WAITING: {what}  ->  click Update library"
 
     def github_line(self):
+        # From the saved login itself, not from the name in the settings.
         c = partsync.load_config()
-        if not c.get("github_login"):
+        token, state, detail = partsync.token_state()
+        if not token:
+            if state == "unreadable":
+                return f"the saved login can't be read ({detail}) - log in again to publish"
+            if c.get("github_login") and github.get_token(self.cfg):  # a login from a version before 0.6
+                return self.github_line()
             return "not logged in (only needed to publish)"
         how = "publishes via pull request" if c.get("publish_mode") == "pr" else "publishes directly"
-        return f"{c['github_login']} ({how})"
+        return f"{c.get('github_login') or 'logged in'} ({how})"
 
     def on_login(self, _):
         login_dialog(self, self.cfg)
         self.refresh()
 
     def on_logout(self, _):
+        if not github.get_token(self.cfg):
+            self.refresh("You are not logged in to GitHub.")
+            return
+        if wx.MessageBox("Log out of GitHub on this computer?\n\nYou will have to log in again before you "
+                         "can publish.", TITLE, wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) != wx.YES:
+            return
         try:
             github.logout(self.cfg)
+            log_note("logged out of GitHub with the Log out button")
         except Exception as e:  # noqa: BLE001
             error(self, e)
         self.refresh("Logged out of GitHub.")
@@ -1225,6 +1268,18 @@ class StatusDialog(wx.Dialog):
 # --------------------------------------------------------------------------
 
 _app = None
+
+
+def log_note(text):
+    """Append a line to plugin.log: why something happened that the user may
+    ask about later (e.g. why a login was asked for)."""
+    import datetime
+    try:
+        with open(partsync.app_dir() / "plugin.log", "a", encoding="utf-8") as f:
+            f.write(f"--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} {text} (Plus381 Tools {__version__}, "
+                    f"{sys.platform})\n")
+    except OSError:
+        pass
 
 
 def log_error(what):

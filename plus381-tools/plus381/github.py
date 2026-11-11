@@ -43,7 +43,7 @@ HOST = urllib.parse.urlparse(WEB).netloc
 
 
 class GitHubError(Exception):
-    pass
+    status = None  # HTTP status when GitHub answered with an error
 
 
 class NetworkError(GitHubError):
@@ -117,7 +117,9 @@ def _json(raw):
 def api(method, path, token, data=None):
     status, body = _request(method, API + path, data, token)
     if status >= 400:
-        raise GitHubError(f"GitHub {method} {path}: {status} {body.get('message', '')}".strip())
+        e = GitHubError(f"GitHub {method} {path}: {status} {body.get('message', '')}".strip())
+        e.status = status
+        raise e
     return body
 
 
@@ -207,10 +209,67 @@ def get_token(cfg):
     login = partsync.load_config().get("github_login")
     if not login:
         return None
-    token = _git_cred(cfg, "fill", {"protocol": "https", "host": HOST, "username": login}).get("password")
-    if token:
-        partsync.save_token(token)
+    try:
+        token = _git_cred(cfg, "fill", {"protocol": "https", "host": HOST, "username": login}).get("password")
+        if token:
+            partsync.save_token(token)
+    except Exception:  # noqa: BLE001 - no Git, a hanging credential helper, ...: just not logged in
+        return None
     return token or None
+
+
+# Why a login is asked for (shown to the user and written to plugin.log).
+LOGIN_PROBLEMS = {
+    "none": "To publish, log in to GitHub once. It takes a few seconds in your browser and KiCad remembers it.",
+    "unreadable": "The GitHub login saved on this computer can't be read any more, so you need to log in once "
+                  "more. (On Windows it is encrypted for your Windows account and can only be read by it.)",
+    "revoked": "GitHub no longer accepts the login saved on this computer: it was revoked on GitHub (Settings > "
+               "Applications > Authorized OAuth Apps), or you logged in more than ten times and GitHub dropped "
+               "the oldest login. You need to log in once more.",
+}
+
+
+def check_login(cfg):
+    """The login saved on this computer, for publishing.
+    Returns (token, mode, problem, detail).
+
+    A saved login is kept and used unless GitHub itself says that it is no
+    longer valid. Being offline, a GitHub hiccup or any other error never
+    counts as "logged out": then the last known publish mode is used and
+    the upload itself shows what is wrong.
+    problem: None, or a key of LOGIN_PROBLEMS when a (new) login is needed."""
+    token, state, detail = partsync.token_state()
+    if not token and state == "none":
+        token = get_token(cfg)  # a login from a version before 0.6
+    if not token:
+        return None, None, state, detail
+    remembered = partsync.load_config().get("publish_mode") or "direct"
+    try:
+        mode = publish_mode(token)
+    except NetworkError:
+        return token, remembered, None, ""
+    except GitHubError as e:
+        if e.status == 401 and _token_rejected(token):
+            return None, None, "revoked", str(e)
+        return token, remembered, None, str(e)
+    if not partsync.load_config().get("github_login"):
+        try:  # the settings lost the name (not the login): look it up again
+            c = partsync.load_config()
+            c["github_login"] = whoami(token)["login"]
+            partsync.save_config(c)
+        except GitHubError:
+            pass
+    return token, mode, None, ""
+
+
+def _token_rejected(token):
+    """A second opinion before giving up a saved login: only True when
+    GitHub again answers that the login itself is invalid."""
+    try:
+        status, _ = _request("GET", API + "/user", token=token)
+    except GitHubError:
+        return False
+    return status == 401
 
 
 def logout(cfg):
@@ -297,7 +356,7 @@ def ensure_fork(token, login):
 def open_pull_request(cfg, token, title, body_text):
     """Push the unpublished commits to the user's fork and open (or update)
     one pull request for them. Returns the pull request's web URL."""
-    login = partsync.load_config()["github_login"]
+    login = partsync.load_config().get("github_login") or whoami(token)["login"]
     fork = ensure_fork(token, login)
     branch = f"parts/{login}"
     owner, name = repo_slug()
